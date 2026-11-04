@@ -183,13 +183,3 @@ fn clock_runs_without_panic_under_pressure() {
     drop(mgr);
     cleanup(&path);
 }
-
-#[test]
-fn storage_returns_borrowable_pair() {
-    let path = unique_path("borrow");
-    let mut db = Database::open(&path, DatabaseOptions::default()).unwrap();
-    let (mgr, pool) = db.storage();
-    let fid = pool.new_page(mgr, PageType::Data).unwrap();
-    pool.unpin(fid).unwrap();
-    cleanup(&path);
-}

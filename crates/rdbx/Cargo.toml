@@ -13,3 +13,4 @@ rdbx-storage = { workspace = true }
 rdbx-buffer  = { workspace = true }
 rdbx-wal     = { workspace = true }
 rdbx-btree   = { workspace = true }
+rdbx-mvcc    = { workspace = true }

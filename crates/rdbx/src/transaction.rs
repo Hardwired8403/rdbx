@@ -1,31 +1,30 @@
-//! Single-writer WAL-backed transactions.
+//! Multi-writer WAL-backed transactions with MVCC snapshot isolation.
 
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::collections::{HashMap, hash_map::Entry};
 
 use rdbx_btree::BTreeStore;
 use rdbx_core::{Error, Lsn, PageId, Result, TxnId};
+use rdbx_mvcc::{Snapshot, SnapshotHandle, Visible};
 use rdbx_storage::{PAGE_HEADER_SIZE, Page, PageType};
 use rdbx_wal::RecordKind;
 
 use crate::database::Database;
 
-/// One in-flight transaction. Dropping without `commit` or `rollback` is a
-/// programmer error; the WAL will still keep the transaction uncommitted and
-/// recovery will undo it on the next open.
-pub struct Transaction<'a> {
-    db: &'a mut Database,
-    txn_id: TxnId,
+/// One in-flight transaction. Borrows the database shared, so multiple
+/// transactions can be opened concurrently from the same thread.
+pub struct Transaction<'db> {
+    db: &'db Database,
+    handle: SnapshotHandle,
     written_pages: Vec<PageId>,
     before_images: HashMap<PageId, Vec<u8>>,
     active: bool,
 }
 
-impl<'a> Transaction<'a> {
-    pub(crate) fn new(db: &'a mut Database, txn_id: TxnId) -> Self {
+impl<'db> Transaction<'db> {
+    pub(crate) fn new(db: &'db Database, handle: SnapshotHandle) -> Self {
         Self {
             db,
-            txn_id,
+            handle,
             written_pages: Vec::new(),
             before_images: HashMap::new(),
             active: true,
@@ -33,7 +32,11 @@ impl<'a> Transaction<'a> {
     }
 
     pub fn txn_id(&self) -> TxnId {
-        self.txn_id
+        self.handle.txn_id
+    }
+
+    pub fn snapshot(&self) -> &Snapshot {
+        &self.handle.snapshot
     }
 
     /// Read a page through the buffer pool.
@@ -41,17 +44,11 @@ impl<'a> Transaction<'a> {
         self.db.read_page(pid)
     }
 
-    /// Allocate a page. The allocation itself is **not** WAL-logged in
-    /// Phase 4: the zeroed page reaches disk immediately, and any
-    /// subsequent `write_page` records its before/after images normally.
-    /// If the transaction aborts, allocated pages may be orphaned; this
-    /// is a known Phase 4 limitation (transactional allocation lands in
-    /// Phase 5 with MVCC).
     pub fn allocate_page(&mut self, page_type: PageType) -> Result<PageId> {
-        self.db.manager.allocate_page(page_type)
+        let mut mgr = self.db.manager.lock().unwrap();
+        mgr.allocate_page(page_type)
     }
 
-    /// Write a page. See `BTreeStore` integration for the trait form.
     pub fn write_page(&mut self, pid: PageId, new_page: &Page) -> Result<()> {
         self.write_page_impl(pid, new_page)
     }
@@ -61,19 +58,22 @@ impl<'a> Transaction<'a> {
             return Err(Error::Internal("transaction is no longer active".into()));
         }
 
-        let fid = self.db.pool.fetch(&mut self.db.manager, pid)?;
+        let mut mgr = self.db.manager.lock().unwrap();
+        let mut pool = self.db.pool.lock().unwrap();
+
+        let fid = pool.fetch(&mut mgr, pid)?;
         let (actual_pid, before) = {
-            let current = self.db.pool.get(fid)?;
+            let current = pool.get(fid)?;
             (current.header.page_id, current.payload.clone())
         };
-        self.db.pool.unpin(fid)?;
+        pool.unpin(fid)?;
         if actual_pid != pid {
             return Err(Error::Internal(format!(
                 "page id mismatch: expected {pid}, got {actual_pid}"
             )));
         }
 
-        let page_size = self.db.manager.page_size();
+        let page_size = mgr.page_size();
         if new_page.payload.len() != page_size - PAGE_HEADER_SIZE {
             return Err(Error::Internal(format!(
                 "new page payload size {} != page_size - header",
@@ -81,25 +81,33 @@ impl<'a> Transaction<'a> {
             )));
         }
         let after = new_page.payload.clone();
+        drop(pool);
+        drop(mgr);
 
-        let lsn = self.db.wal.append(
-            self.txn_id,
+        // WAL the update.
+        let mut wal = self.db.wal.lock().unwrap();
+        let lsn = wal.append(
+            self.handle.txn_id,
             RecordKind::Update,
             pid,
             before.clone(),
             after.clone(),
         )?;
+        drop(wal);
 
         if let Entry::Vacant(slot) = self.before_images.entry(pid) {
             slot.insert(before);
             self.written_pages.push(pid);
         }
 
-        let fid = self.db.pool.fetch(&mut self.db.manager, pid)?;
+        // Apply to buffer pool.
+        let mut mgr = self.db.manager.lock().unwrap();
+        let mut pool = self.db.pool.lock().unwrap();
+        let fid = pool.fetch(&mut mgr, pid)?;
         {
-            let p = self.db.pool.get_mut(fid)?;
+            let p = pool.get_mut(fid)?;
             if p.payload.len() != after.len() {
-                self.db.pool.unpin(fid)?;
+                pool.unpin(fid)?;
                 return Err(Error::Internal(
                     "inconsistent payload size while applying write".into(),
                 ));
@@ -107,58 +115,118 @@ impl<'a> Transaction<'a> {
             p.payload.copy_from_slice(&after);
             p.header.lsn = lsn;
         }
-        self.db.pool.unpin(fid)?;
+        pool.unpin(fid)?;
         Ok(())
     }
 
-    /// Commit: WAL flush → buffer flush → manager flush → Commit record.
+    // --- MVCC convenience ---
+
+    pub fn mvcc_read(&mut self, key: &[u8]) -> Result<Visible> {
+        self.db
+            .mvcc_read(&self.handle.snapshot, self.handle.txn_id, key)
+    }
+
+    pub fn mvcc_write(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
+        self.db.mvcc_write(self.handle.txn_id, key, value)
+    }
+
+    /// Commit: WAL flush, MVCC commit (may fail with `WriteConflict`),
+    /// buffer flush, Commit record.
+    ///
+    /// If MVCC conflict detection fires, the transaction is **not**
+    /// committed and the caller can retry. All page writes recorded
+    /// through this transaction are rolled back in the buffer pool.
     pub fn commit(mut self) -> Result<()> {
         if !self.active {
             return Err(Error::Internal("transaction is no longer active".into()));
         }
-        self.db.wal.flush()?;
-        self.db.pool.flush_all(&mut self.db.manager)?;
-        self.db.manager.flush()?;
-        self.db.wal.append(
-            self.txn_id,
-            RecordKind::Commit,
-            PageId(0),
-            Vec::new(),
-            Vec::new(),
-        )?;
-        self.db.wal.flush()?;
+
+        // 1. WAL flush: all Update records for this transaction are durable.
+        {
+            let mut wal = self.db.wal.lock().unwrap();
+            wal.flush()?;
+        }
+
+        // 2. MVCC commit (conflict detection + version store write).
+        let mvcc_outcome = {
+            let mut tm = self.db.tm.lock().unwrap();
+            tm.commit(self.handle.txn_id, &self.handle.snapshot)
+        };
+        if let Err(commit_err) = mvcc_outcome {
+            // Abort: restore pages, append Abort record.
+            self.rollback_impl()?;
+            return Err(Error::Internal(format!(
+                "transaction aborted: {commit_err:?}"
+            )));
+        }
+
+        // 3. Flush pages.
+        {
+            let mut mgr = self.db.manager.lock().unwrap();
+            let mut pool = self.db.pool.lock().unwrap();
+            pool.flush_all(&mut mgr)?;
+            mgr.flush()?;
+        }
+
+        // 4. Commit record.
+        {
+            let mut wal = self.db.wal.lock().unwrap();
+            wal.append(
+                self.handle.txn_id,
+                RecordKind::Commit,
+                PageId(0),
+                Vec::new(),
+                Vec::new(),
+            )?;
+            wal.flush()?;
+        }
+
         self.active = false;
         Ok(())
     }
 
-    /// Rollback: undo in memory, append Abort, drop dirty frames.
     pub fn rollback(mut self) -> Result<()> {
         if !self.active {
             return Err(Error::Internal("transaction is no longer active".into()));
         }
+        self.rollback_impl()?;
+        self.active = false;
+        Ok(())
+    }
+
+    fn rollback_impl(&mut self) -> Result<()> {
+        let mut mgr = self.db.manager.lock().unwrap();
+        let mut pool = self.db.pool.lock().unwrap();
         for pid in self.written_pages.iter().rev() {
             let Some(before) = self.before_images.get(pid) else {
                 continue;
             };
-            let fid = self.db.pool.fetch(&mut self.db.manager, *pid)?;
+            let fid = pool.fetch(&mut mgr, *pid)?;
             {
-                let p = self.db.pool.get_mut(fid)?;
+                let p = pool.get_mut(fid)?;
                 if p.payload.len() == before.len() {
                     p.payload.copy_from_slice(before);
                 }
                 p.header.lsn = Lsn(0);
             }
-            self.db.pool.unpin(fid)?;
+            pool.unpin(fid)?;
         }
-        self.db.wal.append(
-            self.txn_id,
+        drop(pool);
+        drop(mgr);
+
+        let mut tm = self.db.tm.lock().unwrap();
+        let _ = tm.abort(self.handle.txn_id);
+        drop(tm);
+
+        let mut wal = self.db.wal.lock().unwrap();
+        let _ = wal.append(
+            self.handle.txn_id,
             RecordKind::Abort,
             PageId(0),
             Vec::new(),
             Vec::new(),
-        )?;
-        self.db.wal.flush()?;
-        self.active = false;
+        );
+        let _ = wal.flush();
         Ok(())
     }
 }
@@ -166,29 +234,7 @@ impl<'a> Transaction<'a> {
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         if self.active {
-            let written: Vec<PageId> = self.written_pages.clone();
-            for pid in written.iter().rev() {
-                let Some(before) = self.before_images.get(pid) else {
-                    continue;
-                };
-                if let Ok(fid) = self.db.pool.fetch(&mut self.db.manager, *pid) {
-                    if let Ok(p) = self.db.pool.get_mut(fid)
-                        && p.payload.len() == before.len()
-                    {
-                        p.payload.copy_from_slice(before);
-                        p.header.lsn = Lsn(0);
-                    }
-                    let _ = self.db.pool.unpin(fid);
-                }
-            }
-            let _ = self.db.wal.append(
-                self.txn_id,
-                RecordKind::Abort,
-                PageId(0),
-                Vec::new(),
-                Vec::new(),
-            );
-            let _ = self.db.wal.flush();
+            let _ = self.rollback_impl();
             self.active = false;
         }
     }
@@ -204,10 +250,11 @@ impl BTreeStore for Transaction<'_> {
     }
 
     fn allocate_page(&mut self, page_type: PageType) -> Result<PageId> {
-        self.db.manager.allocate_page(page_type)
+        let mut mgr = self.db.manager.lock().unwrap();
+        mgr.allocate_page(page_type)
     }
 
     fn page_size(&self) -> usize {
-        self.db.manager.page_size()
+        self.db.manager.lock().unwrap().page_size()
     }
 }

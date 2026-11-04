@@ -44,7 +44,7 @@ fn commit_persists_and_reopens() {
         db.flush().unwrap();
     }
     {
-        let mut db = Database::open(&path, DatabaseOptions::default()).unwrap();
+        let db = Database::open(&path, DatabaseOptions::default()).unwrap();
         let pid = db.table("users").unwrap().root_page;
         let page = db.read_page(pid).unwrap();
         assert_eq!(&page.payload[..5], b"HELLO");
@@ -67,7 +67,7 @@ fn rollback_restores_original() {
         db.flush().unwrap();
     }
     {
-        let mut db = Database::open(&path, DatabaseOptions::default()).unwrap();
+        let db = Database::open(&path, DatabaseOptions::default()).unwrap();
         let pid = db.table("t").unwrap().root_page;
         let mut txn = db.begin_transaction().unwrap();
         let mut page = txn.read_page(pid).unwrap();
@@ -80,21 +80,14 @@ fn rollback_restores_original() {
     cleanup_db_and_wal(&path);
 }
 
-/// True crash simulation: spawn ourselves as a child process, which opens
-/// the database, writes an uncommitted page, and calls `std::process::exit(0)`.
-/// `exit` does not run destructors, so no `Abort` record is written and no
-/// dirty pages are flushed. WAL still holds `Begin + Update` (durable in
-/// `SyncMode::Full`), and recovery must undo the update on the next open.
 #[test]
 fn crash_between_write_and_commit_is_undone() {
     if std::env::var("RDBX_CRASH_CHILD").is_ok() {
         crash_child_body();
-        // Unreachable in practice: `crash_child_body` exits via `process::exit`.
         return;
     }
 
     let path = unique_path("crash_undo");
-    // 1. Set the baseline: table exists, page contains "INIT", committed.
     {
         let mut db = Database::open(&path, DatabaseOptions::default()).unwrap();
         db.create_table("t").unwrap();
@@ -107,7 +100,6 @@ fn crash_between_write_and_commit_is_undone() {
         db.flush().unwrap();
     }
 
-    // 2. Child: begin, write "NEW!", exit without commit.
     let exe = std::env::current_exe().expect("current_exe");
     let status = std::process::Command::new(exe)
         .arg("--exact")
@@ -119,9 +111,8 @@ fn crash_between_write_and_commit_is_undone() {
         .expect("spawn child");
     assert!(status.success(), "child process failed: {status:?}");
 
-    // 3. Parent: reopen, recovery undoes the uncommitted update.
     {
-        let mut db = Database::open(&path, DatabaseOptions::default()).unwrap();
+        let db = Database::open(&path, DatabaseOptions::default()).unwrap();
         let pid = db.table("t").unwrap().root_page;
         let page = db.read_page(pid).unwrap();
         assert_eq!(
@@ -135,14 +126,12 @@ fn crash_between_write_and_commit_is_undone() {
 
 fn crash_child_body() {
     let path = std::env::var_os("RDBX_CRASH_DB_PATH").expect("RDBX_CRASH_DB_PATH");
-    let mut db = Database::open(&path, DatabaseOptions::default()).unwrap();
+    let db = Database::open(&path, DatabaseOptions::default()).unwrap();
     let pid = db.table("t").unwrap().root_page;
     let mut txn = db.begin_transaction().unwrap();
     let mut page = txn.read_page(pid).unwrap();
     page.payload[..4].copy_from_slice(b"NEW!");
     txn.write_page(pid, &page).unwrap();
-    // No commit, no rollback, no drop, no flush — simulate power loss.
-    // The parent will reopen and expect "INIT" back.
     std::process::exit(0);
 }
 

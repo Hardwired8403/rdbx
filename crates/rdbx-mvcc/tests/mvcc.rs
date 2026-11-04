@@ -11,7 +11,7 @@ fn read_your_own_writes() {
     tm.write(h.txn_id, b"a".to_vec(), Some(b"1".to_vec()))
         .unwrap();
     assert_eq!(
-        tm.read(&h.snapshot, h.txn_id, b"a"),
+        tm.read(&h.snapshot, h.txn_id, b"a").unwrap(),
         Visible::Present(b"1".to_vec())
     );
 }
@@ -19,26 +19,22 @@ fn read_your_own_writes() {
 #[test]
 fn snapshot_does_not_see_later_commits() {
     let mut tm = TransactionManager::new();
-    // Reader opens a snapshot at commit_ts watermark 1.
     let reader = tm.begin();
 
-    // Writer begins, writes, commits — commit_ts = 1.
     let writer = tm.begin();
     tm.write(writer.txn_id, b"a".to_vec(), Some(b"new".to_vec()))
         .unwrap();
     let outcome = tm.commit(writer.txn_id, &writer.snapshot).unwrap();
     assert_eq!(outcome.commit_ts.0, 1);
 
-    // Reader at snapshot lsn = 1 must not see a commit with ts = 1.
     assert_eq!(
-        tm.read(&reader.snapshot, reader.txn_id, b"a"),
+        tm.read(&reader.snapshot, reader.txn_id, b"a").unwrap(),
         Visible::Absent,
     );
 
-    // A new snapshot at lsn = 2 does see it.
     let later = tm.begin();
     assert_eq!(
-        tm.read(&later.snapshot, later.txn_id, b"a"),
+        tm.read(&later.snapshot, later.txn_id, b"a").unwrap(),
         Visible::Present(b"new".to_vec()),
     );
 }
@@ -57,7 +53,7 @@ fn delete_via_tombstone() {
 
     let later = tm.begin();
     assert_eq!(
-        tm.read(&later.snapshot, later.txn_id, b"a"),
+        tm.read(&later.snapshot, later.txn_id, b"a").unwrap(),
         Visible::Deleted
     );
 }
@@ -65,7 +61,6 @@ fn delete_via_tombstone() {
 #[test]
 fn write_write_conflict_detected() {
     let mut tm = TransactionManager::new();
-    // Two transactions open overlapping snapshots before either commits.
     let a = tm.begin();
     let b = tm.begin();
 
@@ -96,11 +91,11 @@ fn concurrent_disjoint_writes_succeed() {
 
     let later = tm.begin();
     assert_eq!(
-        tm.read(&later.snapshot, later.txn_id, b"x"),
+        tm.read(&later.snapshot, later.txn_id, b"x").unwrap(),
         Visible::Present(b"1".to_vec())
     );
     assert_eq!(
-        tm.read(&later.snapshot, later.txn_id, b"y"),
+        tm.read(&later.snapshot, later.txn_id, b"y").unwrap(),
         Visible::Present(b"2".to_vec())
     );
 }
@@ -116,7 +111,7 @@ fn aborted_txn_leaves_no_trace() {
 
     let later = tm.begin();
     assert_eq!(
-        tm.read(&later.snapshot, later.txn_id, b"k"),
+        tm.read(&later.snapshot, later.txn_id, b"k").unwrap(),
         Visible::Absent
     );
 }
@@ -144,10 +139,8 @@ fn own_write_visible_even_when_snapshot_lsn_is_old() {
     let h = tm.begin();
     tm.write(h.txn_id, b"k".to_vec(), Some(b"self".to_vec()))
         .unwrap();
-    // A snapshot at lsn = 1 would normally not see any commit; own writes
-    // bypass that check.
     assert_eq!(
-        tm.read(&h.snapshot, h.txn_id, b"k"),
+        tm.read(&h.snapshot, h.txn_id, b"k").unwrap(),
         Visible::Present(b"self".to_vec())
     );
 }
@@ -163,7 +156,8 @@ fn versions_accumulate_and_visibility_picks_latest() {
     }
     let final_snap = tm.begin();
     assert_eq!(
-        tm.read(&final_snap.snapshot, final_snap.txn_id, b"k"),
+        tm.read(&final_snap.snapshot, final_snap.txn_id, b"k")
+            .unwrap(),
         Visible::Present(vec![4])
     );
 }

@@ -603,6 +603,7 @@ dependencies = [
  "rdbx-btree",
  "rdbx-buffer",
  "rdbx-core",
+ "rdbx-mvcc",
  "rdbx-storage",
  "rdbx-wal",
 ]

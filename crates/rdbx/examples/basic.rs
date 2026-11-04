@@ -10,7 +10,7 @@ fn main() -> rdbx::Result<()> {
     let path = std::env::temp_dir().join("rdbx-example.rdbx");
     let _ = std::fs::remove_file(&path);
 
-    let mut db = Database::open(&path, DatabaseOptions::default())?;
+    let db = Database::open(&path, DatabaseOptions::default())?;
     println!(
         "Created {} (page_size={}, page_count={})",
         path.display(),
@@ -26,7 +26,7 @@ fn main() -> rdbx::Result<()> {
     println!("Wrote page {pid} ({} bytes)", MSG.len());
     db.close()?;
 
-    let mut db = Database::open(&path, DatabaseOptions::default())?;
+    let db = Database::open(&path, DatabaseOptions::default())?;
     let page = db.page_manager().read_page(pid)?;
     let msg = std::str::from_utf8(&page.payload[..MSG.len()])
         .map_err(|e| rdbx::Error::Internal(format!("payload is not UTF-8: {e}")))?;

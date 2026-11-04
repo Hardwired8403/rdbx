@@ -46,7 +46,7 @@ fn btree_insert_search_commit_reopen() {
         db.close().unwrap();
     }
     {
-        let mut db = Database::open(&path, DatabaseOptions::default()).unwrap();
+        let db = Database::open(&path, DatabaseOptions::default()).unwrap();
         // Root persisted in the catalog.
         let r = db.table("users").unwrap().root_page;
         assert_eq!(r, root);
@@ -123,7 +123,7 @@ fn btree_survives_checkpoint() {
         db.close().unwrap();
     }
     {
-        let mut db = Database::open(&path, DatabaseOptions::default()).unwrap();
+        let db = Database::open(&path, DatabaseOptions::default()).unwrap();
         let root = db.table("t").unwrap().root_page;
         let mut txn = db.begin_transaction().unwrap();
         let tree = BTree::open(root);
