@@ -11,3 +11,4 @@ description = "High-performance embedded database engine."
 rdbx-core    = { workspace = true }
 rdbx-storage = { workspace = true }
 rdbx-buffer  = { workspace = true }
+rdbx-wal     = { workspace = true }

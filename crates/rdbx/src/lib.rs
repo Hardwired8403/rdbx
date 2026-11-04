@@ -1,12 +1,13 @@
 //! # RDBX — High-Performance Embedded Database Engine
 //!
-//! Phase 2 exposes the storage + buffer foundation: a [`Database`] handle
-//! backed by a persistent [`PageManager`] and an in-memory [`BufferPool`],
-//! with a schema catalog on page 1.
+//! Phase 3 exposes the WAL-backed transaction layer: a [`Database`] handle
+//! with a persistent [`PageManager`], an in-memory [`BufferPool`], a schema
+//! [`Catalog`], and a crash-safe [`rdbx_wal::WalManager`].
 //!
-//! Transactions, WAL, B+Tree, and SQL arrive in later milestones.
+//! Transactions, MVCC, B+Tree, and SQL arrive in later milestones.
 
 pub mod database;
+pub mod transaction;
 
 pub use database::Database;
 pub use rdbx_buffer::{BufferPool, BufferStats, Frame, FrameId};
@@ -18,3 +19,5 @@ pub use rdbx_storage::{
     Catalog, FileHeader, MAX_TABLE_NAME_LEN, PAGE_HEADER_SIZE, Page, PageManager, PageType,
     TableDescriptor,
 };
+pub use rdbx_wal::{RecoveryReport, RecoveryStopReason, WalManager};
+pub use transaction::Transaction;

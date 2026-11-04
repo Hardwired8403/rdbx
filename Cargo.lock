@@ -603,6 +603,7 @@ dependencies = [
  "rdbx-buffer",
  "rdbx-core",
  "rdbx-storage",
+ "rdbx-wal",
 ]
 
 [[package]]
@@ -637,6 +638,17 @@ dependencies = [
  "crc32fast",
  "proptest",
  "rdbx-core",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "rdbx-wal"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "rdbx-core",
+ "rdbx-storage",
  "thiserror",
  "uuid",
 ]

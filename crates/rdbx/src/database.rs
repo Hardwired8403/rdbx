@@ -3,20 +3,20 @@
 use std::path::{Path, PathBuf};
 
 use rdbx_buffer::BufferPool;
-use rdbx_core::{DatabaseOptions, Error, PageId, Result};
+use rdbx_core::{DatabaseOptions, Error, PageId, Result, TxnId};
 use rdbx_storage::{Catalog, PageManager, PageType, TableDescriptor};
+use rdbx_wal::{RecordKind, WalManager};
+
+use crate::transaction::Transaction;
 
 /// The embedded database handle.
-///
-/// Owns the persistent [`PageManager`], the in-memory [`BufferPool`], and the
-/// in-memory [`Catalog`]. Phase 2 does not yet expose transactions or SQL;
-/// higher layers drive the storage subsystem through [`Database::storage`]
-/// and the catalog helpers.
 pub struct Database {
     path: PathBuf,
-    manager: PageManager,
-    pool: BufferPool,
+    pub(crate) manager: PageManager,
+    pub(crate) pool: BufferPool,
     catalog: Catalog,
+    pub(crate) wal: WalManager,
+    next_txn_id: u64,
 }
 
 impl Database {
@@ -34,59 +34,101 @@ impl Database {
                 format!("database not found: {}", path.display()),
             )));
         };
+
+        let wal_dir = wal_dir_for(&path);
+        let mut wal = WalManager::open(&wal_dir, opts.sync_mode)?;
+        // Crash recovery runs before the buffer pool and catalog are created,
+        // so the pool never sees a half-applied state.
+        let report = rdbx_wal::recover(&mut wal, &mut manager)?;
+        // Seed the transaction id counter from the highest id present in the
+        // WAL so a new process cannot accidentally reuse a TxnId that
+        // recovery has already classified as committed.
+        let next_txn_id = report
+            .max_txn_id
+            .checked_add(1)
+            .ok_or(Error::Overflow("txn id"))?;
+
         let catalog = Catalog::load(&mut manager)?;
         let pool = BufferPool::new(
             opts.buffer_pool_capacity,
             manager.page_size(),
             opts.buffer_pool_policy,
         );
+
         Ok(Self {
             path,
             manager,
             pool,
             catalog,
+            wal,
+            next_txn_id,
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
-
     pub fn page_size(&self) -> usize {
         self.manager.page_size()
     }
-
     pub fn page_count(&self) -> u64 {
         self.manager.page_count()
     }
-
     pub fn free_page_count(&self) -> u64 {
         self.manager.free_page_count()
     }
 
-    /// Access the page manager directly (bypasses the buffer pool).
-    ///
-    /// Kept for Phase 1 compatibility and low-level tests; new code should
-    /// use [`Database::storage`] to get both the manager and the pool.
+    /// Low-level access to the page manager (bypasses the buffer pool).
     pub fn page_manager(&mut self) -> &mut PageManager {
         &mut self.manager
     }
 
-    /// Borrow both the manager and the buffer pool simultaneously. This is
-    /// the recommended way to drive the storage subsystem:
-    ///
-    /// ```ignore
-    /// let (mgr, pool) = db.storage();
-    /// let fid = pool.fetch(mgr, some_page_id)?;
-    /// ```
+    /// Borrow the manager and the buffer pool simultaneously.
     pub fn storage(&mut self) -> (&mut PageManager, &mut BufferPool) {
         (&mut self.manager, &mut self.pool)
     }
 
-    /// Flush all dirty pages and the manager to disk.
+    /// Read a page through the buffer pool.
+    pub fn read_page(&mut self, pid: PageId) -> Result<rdbx_storage::Page> {
+        let fid = self.pool.fetch(&mut self.manager, pid)?;
+        let page = self.pool.get(fid)?.clone();
+        self.pool.unpin(fid)?;
+        Ok(page)
+    }
+
+    /// Begin a new transaction. The transaction borrows the database mutably
+    /// for its whole lifetime, serialising all writers (single-writer model
+    /// in Phase 3; MVCC arrives in Phase 5).
+    pub fn begin_transaction(&mut self) -> Result<Transaction<'_>> {
+        let txn_id = TxnId(self.next_txn_id);
+        self.next_txn_id = self
+            .next_txn_id
+            .checked_add(1)
+            .ok_or(Error::Overflow("txn id"))?;
+        self.wal
+            .append(txn_id, RecordKind::Begin, PageId(0), Vec::new(), Vec::new())?;
+        Ok(Transaction::new(self, txn_id))
+    }
+
+    /// Flush the WAL, buffer pool, and manager (WAL first, then pages).
     pub fn flush(&mut self) -> Result<()> {
+        self.wal.flush()?;
         self.pool.flush_all(&mut self.manager)?;
         self.manager.flush()?;
+        Ok(())
+    }
+
+    /// Flush everything and truncate the WAL. Use this after a batch of
+    /// committed transactions to reclaim disk space.
+    ///
+    /// `next_txn_id` is intentionally **not** reset: after truncation the WAL
+    /// is empty, and recovery on the next open will seed `next_txn_id = 1`.
+    /// Ids that already reached the data file via checkpoint are safe to
+    /// collide with because recovery only classifies transactions present
+    /// in the current WAL.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        self.flush()?;
+        self.wal.truncate()?;
         Ok(())
     }
 
@@ -101,18 +143,13 @@ impl Database {
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
-
     pub fn tables(&self) -> &[TableDescriptor] {
         &self.catalog.tables
     }
-
     pub fn table(&self, name: &str) -> Option<&TableDescriptor> {
         self.catalog.table_by_name(name)
     }
 
-    /// Create a table: allocate a root page and record the descriptor.
-    /// Returns the root page id. The root page is currently just a zeroed
-    /// data page; Phase 4 will replace it with an empty B+Tree root.
     pub fn create_table(&mut self, name: &str) -> Result<PageId> {
         if self.catalog.table_by_name(name).is_some() {
             return Err(Error::Internal(format!("table '{name}' already exists")));
@@ -129,14 +166,11 @@ impl Database {
         Ok(pid)
     }
 
-    /// Drop a table: free the root page and remove the descriptor.
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
         let desc = self
             .catalog
             .remove_by_name(name)
             .ok_or_else(|| Error::Internal(format!("table '{name}' not found")))?;
-        // If a cached copy exists, drop it before freeing the page.
-        // (`free_page` would error on a pinned frame; caller's responsibility.)
         self.manager.free_page(desc.root_page)?;
         self.catalog.flush(&mut self.manager)?;
         Ok(())
@@ -147,5 +181,16 @@ impl Drop for Database {
     fn drop(&mut self) {
         let _ = self.flush();
         let _ = self.manager.close();
+    }
+}
+
+fn wal_dir_for(db_path: &Path) -> PathBuf {
+    let file_name = db_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("rdbx");
+    match db_path.parent() {
+        Some(parent) => parent.join(format!("{file_name}.wal")),
+        None => PathBuf::from(format!("{file_name}.wal")),
     }
 }

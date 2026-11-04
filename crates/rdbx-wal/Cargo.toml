@@ -1,0 +1,15 @@
+[package]
+name = "rdbx-wal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Write-ahead log and crash recovery for RDBX."
+
+[dependencies]
+rdbx-core    = { workspace = true }
+rdbx-storage = { workspace = true }
+thiserror    = { workspace = true }
+crc32fast    = { workspace = true }
+uuid         = { workspace = true }

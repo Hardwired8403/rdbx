@@ -4,6 +4,7 @@ members = [
     "crates/rdbx-core",
     "crates/rdbx-storage",
     "crates/rdbx-buffer",
+    "crates/rdbx-wal",
     "crates/rdbx",
     "crates/rdbx-bench",
 ]
@@ -19,6 +20,7 @@ authors = ["Hardwired8403"]
 rdbx-core    = { path = "crates/rdbx-core" }
 rdbx-storage = { path = "crates/rdbx-storage" }
 rdbx-buffer  = { path = "crates/rdbx-buffer" }
+rdbx-wal     = { path = "crates/rdbx-wal" }
 thiserror    = "2.0.21"
 crc32fast    = "1.5.4"
 uuid         = { version = "1.29.0", features = ["v4"] }
