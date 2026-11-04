@@ -10,8 +10,8 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/rdbx/rdbx"
-authors = ["RDBX Contributors"]
+repository = "https://github.com/Hardwired8403/rdbx"
+authors = ["Hardwired8403"]
 
 [workspace.dependencies]
 rdbx-core    = { path = "crates/rdbx-core" }
