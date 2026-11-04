@@ -3,7 +3,9 @@ resolver = "2"
 members = [
     "crates/rdbx-core",
     "crates/rdbx-storage",
+    "crates/rdbx-buffer",
     "crates/rdbx",
+    "crates/rdbx-bench",
 ]
 
 [workspace.package]
@@ -16,10 +18,18 @@ authors = ["Hardwired8403"]
 [workspace.dependencies]
 rdbx-core    = { path = "crates/rdbx-core" }
 rdbx-storage = { path = "crates/rdbx-storage" }
+rdbx-buffer  = { path = "crates/rdbx-buffer" }
 thiserror    = "2.0.21"
 crc32fast    = "1.5.4"
 uuid         = { version = "1.29.0", features = ["v4"] }
+proptest     = "1.12.0"
+criterion    = "0.8.2"
+
 
 [profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
 lto = "thin"
 codegen-units = 1

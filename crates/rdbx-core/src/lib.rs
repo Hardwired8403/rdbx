@@ -7,6 +7,9 @@ pub mod config;
 pub mod error;
 pub mod types;
 
-pub use config::{DEFAULT_PAGE_SIZE, DatabaseOptions, MAX_PAGE_SIZE, MIN_PAGE_SIZE, SyncMode};
+pub use config::{
+    DEFAULT_BUFFER_POOL_CAPACITY, DEFAULT_PAGE_SIZE, DatabaseOptions, EvictionPolicyKind,
+    MAX_PAGE_SIZE, MIN_PAGE_SIZE, SyncMode,
+};
 pub use error::{Error, Result};
 pub use types::{Lsn, PageId, TxnId};

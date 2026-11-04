@@ -1,5 +1,6 @@
 //! Page manager: allocate, free, read, write, flush.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ pub struct PageManager {
     page_size: usize,
     header: FileHeader,
     sync_mode: SyncMode,
+    read_only: bool,
     closed: bool,
 }
 
@@ -29,6 +31,11 @@ impl PageManager {
     /// Create a brand-new database file at `path`.
     pub fn create(path: impl AsRef<Path>, opts: &DatabaseOptions) -> Result<Self> {
         opts.validate()?;
+        if opts.read_only {
+            return Err(Error::Internal(
+                "cannot create a database in read-only mode".into(),
+            ));
+        }
         let path = path.as_ref().to_path_buf();
         if path.exists() {
             return Err(Error::InvalidFile(format!(
@@ -51,19 +58,19 @@ impl PageManager {
             page_size: opts.page_size,
             header,
             sync_mode: opts.sync_mode,
+            read_only: false,
             closed: false,
         };
-        // Persist page 0 (file header).
         pm.flush_file_header()?;
-        // Persist page 1 (metadata page, currently zeroed).
         let meta = Page::new(PageId::META, PageType::Meta, opts.page_size);
-        pm.write_page(&meta)?;
+        pm.write_page_inner(&meta)?;
         pm.flush()?;
         Ok(pm)
     }
 
     /// Open an existing database file.
     pub fn open(path: impl AsRef<Path>, opts: &DatabaseOptions) -> Result<Self> {
+        opts.validate()?;
         let path = path.as_ref().to_path_buf();
         if !path.exists() {
             return Err(Error::Io(std::io::Error::new(
@@ -76,8 +83,6 @@ impl PageManager {
             .write(!opts.read_only)
             .open(&path)?;
 
-        // Probe the first 128 bytes to determine page size and verify magic.
-        // File offset 24 = PAGE_HEADER_SIZE → payload starts there.
         let mut probe = [0u8; 128];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut probe).map_err(|e| {
@@ -103,12 +108,22 @@ impl PageManager {
             )));
         }
 
-        // Read page 0 with the correct page size and decode the header.
         let mut header_buf = vec![0u8; disk_page_size];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut header_buf)?;
         let header_page = Page::decode(&header_buf, disk_page_size, PageId::HEADER)?;
         let header = FileHeader::from_page(&header_page)?;
+
+        // Extend the file if `page_count` claims more pages than are physically
+        // present (recovers from crash-between-header-write-and-page-write).
+        let needed = header
+            .page_count
+            .checked_mul(disk_page_size as u64)
+            .ok_or(Error::Overflow("file size computation"))?;
+        let current = file.metadata()?.len();
+        if current < needed {
+            file.set_len(needed)?;
+        }
 
         Ok(PageManager {
             file,
@@ -116,6 +131,7 @@ impl PageManager {
             page_size: disk_page_size,
             header,
             sync_mode: opts.sync_mode,
+            read_only: opts.read_only,
             closed: false,
         })
     }
@@ -135,9 +151,14 @@ impl PageManager {
     pub fn header(&self) -> &FileHeader {
         &self.header
     }
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
 
     /// Allocate a page, reusing from the free list if available.
     pub fn allocate_page(&mut self, page_type: PageType) -> Result<PageId> {
+        self.ensure_writable()?;
+
         if self.header.free_list_head != 0 {
             let pid = PageId(self.header.free_list_head);
             let page = self.read_page(pid)?;
@@ -147,28 +168,34 @@ impl PageManager {
                 )));
             }
             let next = u64::from_le_bytes(page.payload[0..8].try_into().unwrap());
+            let fresh = Page::new(pid, page_type, self.page_size);
+            // Write the data page before updating the header. If we crash in
+            // between, the free-list head still points to what is now a Data
+            // page; the next allocate detects the mismatch and errors out.
+            self.write_page_inner(&fresh)?;
             self.header.free_list_head = next;
             self.header.free_page_count = self.header.free_page_count.saturating_sub(1);
             self.flush_file_header()?;
-            let fresh = Page::new(pid, page_type, self.page_size);
-            self.write_page(&fresh)?;
             return Ok(pid);
         }
 
         let pid = PageId(self.header.page_count);
-        self.header.page_count = self
+        let new_count = self
             .header
             .page_count
             .checked_add(1)
             .ok_or(Error::Overflow("page_count"))?;
-        self.flush_file_header()?;
         let page = Page::new(pid, page_type, self.page_size);
-        self.write_page(&page)?;
+        // Same ordering rationale: write the page, then bump the counter.
+        self.write_page_inner(&page)?;
+        self.header.page_count = new_count;
+        self.flush_file_header()?;
         Ok(pid)
     }
 
     /// Free a page and link it into the free list.
     pub fn free_page(&mut self, pid: PageId) -> Result<()> {
+        self.ensure_writable()?;
         if pid.0 < RESERVED_PAGES {
             return Err(Error::Internal(format!("cannot free reserved page {pid}")));
         }
@@ -177,11 +204,11 @@ impl PageManager {
         }
         let existing = self.read_page(pid)?;
         if existing.header.page_type == PageType::Free {
-            return Ok(()); // idempotent
+            return Ok(());
         }
         let mut free_page = Page::new(pid, PageType::Free, self.page_size);
         free_page.payload[0..8].copy_from_slice(&self.header.free_list_head.to_le_bytes());
-        self.write_page(&free_page)?;
+        self.write_page_inner(&free_page)?;
         self.header.free_list_head = pid.0;
         self.header.free_page_count = self
             .header
@@ -210,17 +237,19 @@ impl PageManager {
 
     /// Write a page. The page's `page_id` must already exist.
     pub fn write_page(&mut self, page: &Page) -> Result<()> {
+        self.ensure_writable()?;
         let pid = page.header.page_id;
         if pid.0 >= self.header.page_count {
             return Err(Error::PageOutOfBounds(pid.0));
         }
-        let raw = page.encode(self.page_size)?;
-        self.write_raw_page(pid, &raw)?;
-        Ok(())
+        self.write_page_inner(page)
     }
 
     /// Flush OS buffers according to `sync_mode`.
     pub fn flush(&mut self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         match self.sync_mode {
             SyncMode::Full | SyncMode::Normal => self.file.sync_all()?,
             SyncMode::Off => self.file.flush()?,
@@ -238,12 +267,52 @@ impl PageManager {
         Ok(())
     }
 
+    /// Walk the free list and verify it is consistent (no cycles, all entries
+    /// are `Free` pages, all ids in range, and the count matches
+    /// `free_page_count`).
+    pub fn is_free_list_well_formed(&mut self) -> Result<bool> {
+        let mut seen = HashSet::new();
+        let mut cur = self.header.free_list_head;
+        let mut walked = 0u64;
+        while cur != 0 {
+            walked += 1;
+            if walked > self.header.page_count {
+                return Ok(false);
+            }
+            if !seen.insert(cur) {
+                return Ok(false);
+            }
+            if cur < RESERVED_PAGES || cur >= self.header.page_count {
+                return Ok(false);
+            }
+            let page = self.read_page(PageId(cur))?;
+            if page.header.page_type != PageType::Free {
+                return Ok(false);
+            }
+            cur = u64::from_le_bytes(page.payload[0..8].try_into().unwrap());
+        }
+        Ok(walked == self.header.free_page_count)
+    }
+
     // --- internals ---
+
+    fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(Error::Internal("database is read-only".into()));
+        }
+        Ok(())
+    }
 
     fn flush_file_header(&mut self) -> Result<()> {
         let page = self.header.to_page()?;
         let raw = page.encode(self.page_size)?;
         self.write_raw_page(PageId::HEADER, &raw)?;
+        Ok(())
+    }
+
+    fn write_page_inner(&mut self, page: &Page) -> Result<()> {
+        let raw = page.encode(self.page_size)?;
+        self.write_raw_page(page.header.page_id, &raw)?;
         Ok(())
     }
 
@@ -283,7 +352,6 @@ fn unix_nanos_now() -> u64 {
         .unwrap_or(0)
 }
 
-// Silence "unused" warnings when only some Lsn helpers are used in Phase 1.
 #[allow(dead_code)]
 fn _lsn_helper(lsn: Lsn) -> u64 {
     lsn.0

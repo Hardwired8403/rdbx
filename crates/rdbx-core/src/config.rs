@@ -9,6 +9,9 @@ pub const MIN_PAGE_SIZE: usize = 4 * 1024;
 /// Maximum allowed page size.
 pub const MAX_PAGE_SIZE: usize = 64 * 1024;
 
+/// Default buffer pool capacity in frames (256 × 16 KiB = 4 MiB).
+pub const DEFAULT_BUFFER_POOL_CAPACITY: usize = 256;
+
 /// Durability policy for `flush` operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
@@ -18,6 +21,15 @@ pub enum SyncMode {
     Normal,
     /// No `fsync` (only for ephemeral data).
     Off,
+}
+
+/// Eviction policy implemented by the buffer pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionPolicyKind {
+    /// Least Recently Used.
+    Lru,
+    /// Clock (second-chance).
+    Clock,
 }
 
 /// Options passed to [`crate::Database`] at open time.
@@ -31,6 +43,10 @@ pub struct DatabaseOptions {
     pub read_only: bool,
     /// Durability policy.
     pub sync_mode: SyncMode,
+    /// Number of frames held by the buffer pool. Must be > 0.
+    pub buffer_pool_capacity: usize,
+    /// Buffer pool eviction policy.
+    pub buffer_pool_policy: EvictionPolicyKind,
 }
 
 impl Default for DatabaseOptions {
@@ -40,6 +56,8 @@ impl Default for DatabaseOptions {
             create_if_missing: true,
             read_only: false,
             sync_mode: SyncMode::Full,
+            buffer_pool_capacity: DEFAULT_BUFFER_POOL_CAPACITY,
+            buffer_pool_policy: EvictionPolicyKind::Lru,
         }
     }
 }
@@ -55,6 +73,11 @@ impl DatabaseOptions {
         }
         if !self.page_size.is_power_of_two() {
             return Err(Error::Internal("page_size must be a power of two".into()));
+        }
+        if self.buffer_pool_capacity == 0 {
+            return Err(Error::Internal(
+                "buffer_pool_capacity must be greater than zero".into(),
+            ));
         }
         Ok(())
     }

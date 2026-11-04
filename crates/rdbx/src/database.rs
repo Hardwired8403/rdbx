@@ -2,16 +2,21 @@
 
 use std::path::{Path, PathBuf};
 
-use rdbx_core::{DatabaseOptions, Error, Result};
-use rdbx_storage::PageManager;
+use rdbx_buffer::BufferPool;
+use rdbx_core::{DatabaseOptions, Error, PageId, Result};
+use rdbx_storage::{Catalog, PageManager, PageType, TableDescriptor};
 
 /// The embedded database handle.
 ///
-/// In Phase 1 this wraps the page manager and provides lifecycle operations.
-/// Phase 5 will add `begin_transaction`; Phase 7 will add `execute(sql)`.
+/// Owns the persistent [`PageManager`], the in-memory [`BufferPool`], and the
+/// in-memory [`Catalog`]. Phase 2 does not yet expose transactions or SQL;
+/// higher layers drive the storage subsystem through [`Database::storage`]
+/// and the catalog helpers.
 pub struct Database {
     path: PathBuf,
-    inner: PageManager,
+    manager: PageManager,
+    pool: BufferPool,
+    catalog: Catalog,
 }
 
 impl Database {
@@ -19,7 +24,7 @@ impl Database {
     pub fn open(path: impl AsRef<Path>, opts: DatabaseOptions) -> Result<Self> {
         opts.validate()?;
         let path = path.as_ref().to_path_buf();
-        let inner = if path.exists() {
+        let mut manager = if path.exists() {
             PageManager::open(&path, &opts)?
         } else if opts.create_if_missing {
             PageManager::create(&path, &opts)?
@@ -29,7 +34,18 @@ impl Database {
                 format!("database not found: {}", path.display()),
             )));
         };
-        Ok(Self { path, inner })
+        let catalog = Catalog::load(&mut manager)?;
+        let pool = BufferPool::new(
+            opts.buffer_pool_capacity,
+            manager.page_size(),
+            opts.buffer_pool_policy,
+        );
+        Ok(Self {
+            path,
+            manager,
+            pool,
+            catalog,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -37,38 +53,99 @@ impl Database {
     }
 
     pub fn page_size(&self) -> usize {
-        self.inner.page_size()
+        self.manager.page_size()
     }
 
     pub fn page_count(&self) -> u64 {
-        self.inner.page_count()
+        self.manager.page_count()
     }
 
     pub fn free_page_count(&self) -> u64 {
-        self.inner.free_page_count()
+        self.manager.free_page_count()
     }
 
-    /// Low-level access to the page manager.
+    /// Access the page manager directly (bypasses the buffer pool).
     ///
-    /// Intended for tests and upcoming subsystems. Higher-level APIs will
-    /// replace direct page access in later phases.
+    /// Kept for Phase 1 compatibility and low-level tests; new code should
+    /// use [`Database::storage`] to get both the manager and the pool.
     pub fn page_manager(&mut self) -> &mut PageManager {
-        &mut self.inner
+        &mut self.manager
     }
 
-    /// Flush pending writes.
+    /// Borrow both the manager and the buffer pool simultaneously. This is
+    /// the recommended way to drive the storage subsystem:
+    ///
+    /// ```ignore
+    /// let (mgr, pool) = db.storage();
+    /// let fid = pool.fetch(mgr, some_page_id)?;
+    /// ```
+    pub fn storage(&mut self) -> (&mut PageManager, &mut BufferPool) {
+        (&mut self.manager, &mut self.pool)
+    }
+
+    /// Flush all dirty pages and the manager to disk.
     pub fn flush(&mut self) -> Result<()> {
-        self.inner.flush()
+        self.pool.flush_all(&mut self.manager)?;
+        self.manager.flush()?;
+        Ok(())
     }
 
     /// Gracefully close the database.
     pub fn close(mut self) -> Result<()> {
-        self.inner.close()
+        self.flush()?;
+        self.manager.close()
+    }
+
+    // --- catalog ---
+
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    pub fn tables(&self) -> &[TableDescriptor] {
+        &self.catalog.tables
+    }
+
+    pub fn table(&self, name: &str) -> Option<&TableDescriptor> {
+        self.catalog.table_by_name(name)
+    }
+
+    /// Create a table: allocate a root page and record the descriptor.
+    /// Returns the root page id. The root page is currently just a zeroed
+    /// data page; Phase 4 will replace it with an empty B+Tree root.
+    pub fn create_table(&mut self, name: &str) -> Result<PageId> {
+        if self.catalog.table_by_name(name).is_some() {
+            return Err(Error::Internal(format!("table '{name}' already exists")));
+        }
+        let pid = self.manager.allocate_page(PageType::Data)?;
+        let desc = TableDescriptor {
+            id: self.catalog.next_table_id.max(1),
+            name: name.to_string(),
+            root_page: pid,
+            schema_hash: [0u8; 16],
+        };
+        self.catalog.insert(desc);
+        self.catalog.flush(&mut self.manager)?;
+        Ok(pid)
+    }
+
+    /// Drop a table: free the root page and remove the descriptor.
+    pub fn drop_table(&mut self, name: &str) -> Result<()> {
+        let desc = self
+            .catalog
+            .remove_by_name(name)
+            .ok_or_else(|| Error::Internal(format!("table '{name}' not found")))?;
+        // If a cached copy exists, drop it before freeing the page.
+        // (`free_page` would error on a pinned frame; caller's responsibility.)
+        self.manager.free_page(desc.root_page)?;
+        self.catalog.flush(&mut self.manager)?;
+        Ok(())
     }
 }
 
 impl Drop for Database {
     fn drop(&mut self) {
-        let _ = self.inner.close();
+        let _ = self.flush();
+        let _ = self.manager.close();
     }
 }

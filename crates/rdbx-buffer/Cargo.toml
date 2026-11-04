@@ -1,0 +1,12 @@
+[package]
+name = "rdbx-buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "In-memory buffer pool for RDBX."
+
+[dependencies]
+rdbx-core    = { workspace = true }
+rdbx-storage = { workspace = true }

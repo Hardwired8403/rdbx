@@ -10,3 +10,4 @@ description = "High-performance embedded database engine."
 [dependencies]
 rdbx-core    = { workspace = true }
 rdbx-storage = { workspace = true }
+rdbx-buffer  = { workspace = true }
