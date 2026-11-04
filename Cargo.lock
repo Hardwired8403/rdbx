@@ -604,6 +604,8 @@ dependencies = [
  "rdbx-buffer",
  "rdbx-core",
  "rdbx-mvcc",
+ "rdbx-query",
+ "rdbx-sql",
  "rdbx-storage",
  "rdbx-wal",
 ]
@@ -657,6 +659,16 @@ dependencies = [
  "proptest",
  "rdbx-btree",
  "rdbx-core",
+ "rdbx-storage",
+]
+
+[[package]]
+name = "rdbx-sql"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rdbx-core",
+ "rdbx-query",
  "rdbx-storage",
 ]
 

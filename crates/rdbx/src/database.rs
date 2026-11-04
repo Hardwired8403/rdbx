@@ -21,6 +21,7 @@ pub struct Database {
     pub(crate) wal: Arc<Mutex<WalManager>>,
     pub(crate) tm: Arc<Mutex<TransactionManager>>,
     pub(crate) mvcc_root: Mutex<PageId>,
+    pub(crate) sql_catalog: Mutex<rdbx_sql::catalog::SqlCatalog>,
 }
 
 impl Database {
@@ -110,6 +111,7 @@ impl Database {
             wal: Arc::new(Mutex::new(wal)),
             tm: Arc::new(Mutex::new(tm)),
             mvcc_root: Mutex::new(mvcc_root),
+            sql_catalog: Mutex::new(rdbx_sql::catalog::SqlCatalog::new()),
         })
     }
 
@@ -268,6 +270,10 @@ impl Database {
     }
 
     pub fn create_table(&mut self, name: &str) -> Result<PageId> {
+        self.create_table_locked(name)
+    }
+
+    pub(crate) fn create_table_locked(&self, name: &str) -> Result<PageId> {
         if self.catalog.lock().unwrap().table_by_name(name).is_some() {
             return Err(Error::Internal(format!("table '{name}' already exists")));
         }
@@ -292,6 +298,10 @@ impl Database {
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
+        self.drop_table_locked(name)
+    }
+
+    pub(crate) fn drop_table_locked(&self, name: &str) -> Result<()> {
         let mut mgr = self.manager.lock().unwrap();
         let mut catalog = self.catalog.lock().unwrap();
         let desc = catalog

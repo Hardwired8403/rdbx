@@ -1,12 +1,6 @@
-//! # RDBX — High-Performance Embedded Database Engine
-//!
-//! Phase 5b exposes the persisted MVCC layer: versions live in a
-//! dedicated B+Tree, conflict detection runs at commit, and multiple
-//! transactions can coexist thanks to shared ownership of the storage
-//! subsystems.
-
 pub mod database;
 mod mvcc_store;
+pub mod sql;
 pub mod transaction;
 
 pub use database::Database;
@@ -26,4 +20,9 @@ pub use rdbx_storage::{
     TableDescriptor,
 };
 pub use rdbx_wal::{RecoveryReport, RecoveryStopReason, WalManager};
+pub use sql::QueryResult;
 pub use transaction::Transaction;
+
+// Re-export `Row` and `Value` from rdbx-query so SQL users don't need a
+// direct dependency on that crate.
+pub use rdbx_query::value::{Row, Value};

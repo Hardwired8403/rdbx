@@ -14,3 +14,5 @@ rdbx-buffer  = { workspace = true }
 rdbx-wal     = { workspace = true }
 rdbx-btree   = { workspace = true }
 rdbx-mvcc    = { workspace = true }
+rdbx-query   = { workspace = true }
+rdbx-sql     = { workspace = true }

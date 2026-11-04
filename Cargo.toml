@@ -8,6 +8,7 @@ members = [
     "crates/rdbx-btree",
     "crates/rdbx-mvcc",
     "crates/rdbx-query",
+    "crates/rdbx-sql",
     "crates/rdbx",
     "crates/rdbx-bench",
 ]
@@ -27,6 +28,7 @@ rdbx-wal     = { path = "crates/rdbx-wal" }
 rdbx-btree   = { path = "crates/rdbx-btree" }
 rdbx-mvcc    = { path = "crates/rdbx-mvcc" }
 rdbx-query   = { path = "crates/rdbx-query" }
+rdbx-sql     = { path = "crates/rdbx-sql" }
 thiserror    = "2.0.21"
 crc32fast    = "1.5.4"
 uuid         = { version = "1.29.0", features = ["v4"] }

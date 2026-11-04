@@ -22,8 +22,33 @@ PostgreSQL, or RocksDB.
 | MVCC (in-memory snapshot isolation) | 5a | ✅ implemented |
 | MVCC persistence + multi-writer + GC | 5b | ✅ implemented |
 | Query engine (logical/physical plans, optimiser) | 6 | ✅ implemented |
-| SQL parser + executor | 7 | ⏳ planned |
+| SQL: parser + planner + `Database::execute` | 7 | ✅ implemented (MVP) |
 | CLI / productisation | 8 | ⏳ planned |
+
+## SQL quick start
+
+```rust
+use rdbx::{Database, DatabaseOptions, QueryResult, Value};
+
+fn main() -> rdbx::Result<()> {
+    let db = Database::open("./data", DatabaseOptions::default())?;
+
+    db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")?;
+    db.execute("INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob')")?;
+
+    match db.execute("SELECT * FROM users WHERE id > 0")? {
+        QueryResult::Rows { columns, rows } => {
+            println!("columns: {:?}", columns);
+            for row in rows {
+                println!("{:?}", row);
+            }
+        }
+        QueryResult::Affected(n) => println!("affected {n}"),
+    }
+
+    db.close()
+}
+```
 
 
 ## Project layout
