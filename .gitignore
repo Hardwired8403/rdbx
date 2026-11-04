@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+/data
+*.rdbx
+*.rdbx.wal
+.DS_Store

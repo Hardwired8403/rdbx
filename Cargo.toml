@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rdbx-core",
+    "crates/rdbx-storage",
+    "crates/rdbx",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/rdbx/rdbx"
+authors = ["RDBX Contributors"]
+
+[workspace.dependencies]
+rdbx-core    = { path = "crates/rdbx-core" }
+rdbx-storage = { path = "crates/rdbx-storage" }
+thiserror    = "2.0.21"
+crc32fast    = "1.5.4"
+uuid         = { version = "1.29.0", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

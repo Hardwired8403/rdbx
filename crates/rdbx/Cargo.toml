@@ -1,0 +1,12 @@
+[package]
+name = "rdbx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "High-performance embedded database engine."
+
+[dependencies]
+rdbx-core    = { workspace = true }
+rdbx-storage = { workspace = true }
