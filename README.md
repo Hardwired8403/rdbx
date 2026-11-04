@@ -19,10 +19,23 @@ PostgreSQL, or RocksDB.
 | Crash recovery (redo/undo, steal + no-force) | 3 | ✅ implemented |
 | Single-writer transactions (WAL-backed) | 3 | ✅ implemented |
 | B+Tree index (search/insert/delete/range) | 4 | ✅ implemented |
-| MVCC / multi-writer transactions | 5 | ⏳ planned |
+| MVCC model (in-memory snapshot isolation) | 5a | ✅ implemented |
+| MVCC persistence + multi-writer concurrency + GC | 5b | ⏳ planned |
 | Query engine / optimiser | 6 | ⏳ planned |
 | SQL parser + executor | 7 | ⏳ planned |
 | CLI / productisation | 8 | ⏳ planned |
+
+## Isolation guarantees
+
+| Property | Status |
+|---|---|
+| Snapshot isolation (in-memory `rdbx-mvcc`) | ✅ implemented |
+| Write-write conflict detection | ✅ implemented |
+| Serializable isolation | ❌ not implemented |
+| Durable MVCC versions | ❌ not implemented (Phase 5b) |
+| Multi-writer concurrency at the API level | ❌ not implemented (Phase 5b) |
+
+RDBX does not claim stronger isolation than this table.
 
 ## Quick start
 
@@ -59,16 +72,15 @@ crates/
 ├── rdbx-buffer   — buffer pool, LRU / Clock eviction
 ├── rdbx-wal      — write-ahead log, crash recovery
 ├── rdbx-btree    — B+Tree index (storage-agnostic via BTreeStore)
+├── rdbx-mvcc     — MVCC model (snapshot isolation, conflict detection)
 ├── rdbx          — public Database handle + transactions
 └── rdbx-bench    — Criterion benchmarks
-
 docs/
-├── storage/
-│   ├── BUFFER_POOL.md
-│   ├── CATALOG.md
-│   └── BTREE.md
-└── transactions/
-    └── WAL.md
+├── storage/BUFFER_POOL.md
+├── storage/CATALOG.md
+├── storage/BTREE.md
+├── transactions/WAL.md
+└── transactions/MVCC.md
 ```
 
 ## Testing
@@ -91,16 +103,19 @@ RDBX does **not** claim stronger durability than this table.
 
 ## Known limitations
 
-- Single-writer: a transaction holds `&mut Database`. MVCC arrives in Phase 5.
+- Single-writer: a transaction holds &mut Database. MVCC concurrency
+arrives in Phase 5b.
+- MVCC layer is in-memory only; not integrated with B+Tree or WAL yet.
 - Buffer pool is single-threaded.
 - B+Tree page allocation is not WAL-logged: aborted transactions may
-orphan pages (Phase 5 fixes this).
+orphan pages.
+- No redistribution in the B+Tree; underflow is handled by merge-only.
 - Keys are opaque bytes with lexicographic comparison; typed encoding is
 the SQL layer's responsibility (Phase 7).
 - Catalog fits in one page and is not transactional.
 - Recovery has no compensation log records (CLRs); aborted transactions
 are undone again on each recovery pass.
-- `next_txn_id` is recovered from the WAL, not persisted in the data file.
+- No MVCC garbage collection; old versions accumulate.
 
 ## Documentation
 
@@ -108,3 +123,4 @@ are undone again on each recovery pass.
 - [`docs/storage/CATALOG.md`](docs/storage/CATALOG.md)
 - [`docs/storage/BTREE.md`](docs/storage/BTREE.md)
 - [`docs/transactions/WAL.md`](docs/transactions/WAL.md)
+- [`docs/transactions/MVCC.md`](docs/transactions/MVCC.md)

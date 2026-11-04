@@ -642,6 +642,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdbx-mvcc"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rdbx-core",
+]
+
+[[package]]
 name = "rdbx-storage"
 version = "0.1.0"
 dependencies = [
