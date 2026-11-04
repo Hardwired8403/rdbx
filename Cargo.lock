@@ -600,6 +600,7 @@ dependencies = [
 name = "rdbx"
 version = "0.1.0"
 dependencies = [
+ "rdbx-btree",
  "rdbx-buffer",
  "rdbx-core",
  "rdbx-storage",
@@ -612,6 +613,15 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "rdbx-buffer",
+ "rdbx-core",
+ "rdbx-storage",
+]
+
+[[package]]
+name = "rdbx-btree"
+version = "0.1.0"
+dependencies = [
+ "proptest",
  "rdbx-core",
  "rdbx-storage",
 ]

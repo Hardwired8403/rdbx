@@ -2,9 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
+use rdbx_btree::{BTreeStore, LeafNode, Node};
 use rdbx_buffer::BufferPool;
 use rdbx_core::{DatabaseOptions, Error, PageId, Result, TxnId};
-use rdbx_storage::{Catalog, PageManager, PageType, TableDescriptor};
+use rdbx_storage::{Catalog, Page, PageManager, PageType, TableDescriptor};
 use rdbx_wal::{RecordKind, WalManager};
 
 use crate::transaction::Transaction;
@@ -37,12 +38,7 @@ impl Database {
 
         let wal_dir = wal_dir_for(&path);
         let mut wal = WalManager::open(&wal_dir, opts.sync_mode)?;
-        // Crash recovery runs before the buffer pool and catalog are created,
-        // so the pool never sees a half-applied state.
         let report = rdbx_wal::recover(&mut wal, &mut manager)?;
-        // Seed the transaction id counter from the highest id present in the
-        // WAL so a new process cannot accidentally reuse a TxnId that
-        // recovery has already classified as committed.
         let next_txn_id = report
             .max_txn_id
             .checked_add(1)
@@ -89,16 +85,14 @@ impl Database {
     }
 
     /// Read a page through the buffer pool.
-    pub fn read_page(&mut self, pid: PageId) -> Result<rdbx_storage::Page> {
+    pub fn read_page(&mut self, pid: PageId) -> Result<Page> {
         let fid = self.pool.fetch(&mut self.manager, pid)?;
         let page = self.pool.get(fid)?.clone();
         self.pool.unpin(fid)?;
         Ok(page)
     }
 
-    /// Begin a new transaction. The transaction borrows the database mutably
-    /// for its whole lifetime, serialising all writers (single-writer model
-    /// in Phase 3; MVCC arrives in Phase 5).
+    /// Begin a new transaction.
     pub fn begin_transaction(&mut self) -> Result<Transaction<'_>> {
         let txn_id = TxnId(self.next_txn_id);
         self.next_txn_id = self
@@ -118,14 +112,7 @@ impl Database {
         Ok(())
     }
 
-    /// Flush everything and truncate the WAL. Use this after a batch of
-    /// committed transactions to reclaim disk space.
-    ///
-    /// `next_txn_id` is intentionally **not** reset: after truncation the WAL
-    /// is empty, and recovery on the next open will seed `next_txn_id = 1`.
-    /// Ids that already reached the data file via checkpoint are safe to
-    /// collide with because recovery only classifies transactions present
-    /// in the current WAL.
+    /// Flush everything and truncate the WAL.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.flush()?;
         self.wal.truncate()?;
@@ -150,20 +137,26 @@ impl Database {
         self.catalog.table_by_name(name)
     }
 
+    /// Create a new table. The root page is initialised to an empty
+    /// B+Tree leaf; callers open it with `BTree::open(root_page)`.
     pub fn create_table(&mut self, name: &str) -> Result<PageId> {
         if self.catalog.table_by_name(name).is_some() {
             return Err(Error::Internal(format!("table '{name}' already exists")));
         }
-        let pid = self.manager.allocate_page(PageType::Data)?;
+        let root_pid = self.manager.allocate_page(PageType::Index)?;
+        let leaf = LeafNode::new();
+        let mut page = Page::new(root_pid, PageType::Index, self.manager.page_size());
+        Node::Leaf(leaf).write_to(&mut page)?;
+        self.manager.write_page(&page)?;
         let desc = TableDescriptor {
             id: self.catalog.next_table_id.max(1),
             name: name.to_string(),
-            root_page: pid,
+            root_page: root_pid,
             schema_hash: [0u8; 16],
         };
         self.catalog.insert(desc);
         self.catalog.flush(&mut self.manager)?;
-        Ok(pid)
+        Ok(root_pid)
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
@@ -181,6 +174,31 @@ impl Drop for Database {
     fn drop(&mut self) {
         let _ = self.flush();
         let _ = self.manager.close();
+    }
+}
+
+impl BTreeStore for Database {
+    fn read_page(&mut self, pid: PageId) -> Result<Page> {
+        Database::read_page(self, pid)
+    }
+
+    fn write_page(&mut self, pid: PageId, page: &Page) -> Result<()> {
+        let fid = self.pool.fetch(&mut self.manager, pid)?;
+        {
+            let p = self.pool.get_mut(fid)?;
+            p.payload.copy_from_slice(&page.payload);
+            p.header.lsn = page.header.lsn;
+        }
+        self.pool.unpin(fid)?;
+        Ok(())
+    }
+
+    fn allocate_page(&mut self, page_type: PageType) -> Result<PageId> {
+        self.manager.allocate_page(page_type)
+    }
+
+    fn page_size(&self) -> usize {
+        self.manager.page_size()
     }
 }
 

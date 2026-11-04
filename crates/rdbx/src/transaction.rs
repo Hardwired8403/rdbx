@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
+use rdbx_btree::BTreeStore;
 use rdbx_core::{Error, Lsn, PageId, Result, TxnId};
-use rdbx_storage::{PAGE_HEADER_SIZE, Page};
+use rdbx_storage::{PAGE_HEADER_SIZE, Page, PageType};
 use rdbx_wal::RecordKind;
 
 use crate::database::Database;
@@ -40,18 +41,26 @@ impl<'a> Transaction<'a> {
         self.db.read_page(pid)
     }
 
-    /// Write a page. The full before image is captured (once) and an
-    /// `Update` record is appended to the WAL.
-    ///
-    /// Only the payload is applied; the caller cannot change page type or
-    /// page id through this method. Page type is fixed at allocation time.
+    /// Allocate a page. The allocation itself is **not** WAL-logged in
+    /// Phase 4: the zeroed page reaches disk immediately, and any
+    /// subsequent `write_page` records its before/after images normally.
+    /// If the transaction aborts, allocated pages may be orphaned; this
+    /// is a known Phase 4 limitation (transactional allocation lands in
+    /// Phase 5 with MVCC).
+    pub fn allocate_page(&mut self, page_type: PageType) -> Result<PageId> {
+        self.db.manager.allocate_page(page_type)
+    }
+
+    /// Write a page. See `BTreeStore` integration for the trait form.
     pub fn write_page(&mut self, pid: PageId, new_page: &Page) -> Result<()> {
+        self.write_page_impl(pid, new_page)
+    }
+
+    fn write_page_impl(&mut self, pid: PageId, new_page: &Page) -> Result<()> {
         if !self.active {
             return Err(Error::Internal("transaction is no longer active".into()));
         }
 
-        // Snapshot the current frame contents while holding an immutable
-        // borrow, then release it before mutating the pool.
         let fid = self.db.pool.fetch(&mut self.db.manager, pid)?;
         let (actual_pid, before) = {
             let current = self.db.pool.get(fid)?;
@@ -107,12 +116,9 @@ impl<'a> Transaction<'a> {
         if !self.active {
             return Err(Error::Internal("transaction is no longer active".into()));
         }
-        // 1. WAL rule: every Update must be durable before pages hit disk.
         self.db.wal.flush()?;
-        // 2. Flush dirty pages with their already-assigned LSNs.
         self.db.pool.flush_all(&mut self.db.manager)?;
         self.db.manager.flush()?;
-        // 3. Record the commit.
         self.db.wal.append(
             self.txn_id,
             RecordKind::Commit,
@@ -121,7 +127,6 @@ impl<'a> Transaction<'a> {
             Vec::new(),
         )?;
         self.db.wal.flush()?;
-
         self.active = false;
         Ok(())
     }
@@ -153,7 +158,6 @@ impl<'a> Transaction<'a> {
             Vec::new(),
         )?;
         self.db.wal.flush()?;
-
         self.active = false;
         Ok(())
     }
@@ -162,9 +166,6 @@ impl<'a> Transaction<'a> {
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         if self.active {
-            // Best-effort cleanup. Failures are ignored (Drop cannot report),
-            // but the WAL will still leave the txn uncommitted so recovery
-            // undoes it on the next open.
             let written: Vec<PageId> = self.written_pages.clone();
             for pid in written.iter().rev() {
                 let Some(before) = self.before_images.get(pid) else {
@@ -190,5 +191,23 @@ impl Drop for Transaction<'_> {
             let _ = self.db.wal.flush();
             self.active = false;
         }
+    }
+}
+
+impl BTreeStore for Transaction<'_> {
+    fn read_page(&mut self, pid: PageId) -> Result<Page> {
+        self.db.read_page(pid)
+    }
+
+    fn write_page(&mut self, pid: PageId, page: &Page) -> Result<()> {
+        self.write_page_impl(pid, page)
+    }
+
+    fn allocate_page(&mut self, page_type: PageType) -> Result<PageId> {
+        self.db.manager.allocate_page(page_type)
+    }
+
+    fn page_size(&self) -> usize {
+        self.db.manager.page_size()
     }
 }

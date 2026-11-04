@@ -1,0 +1,15 @@
+[package]
+name = "rdbx-btree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "B+Tree index for RDBX."
+
+[dependencies]
+rdbx-core = { path = "../rdbx-core" }
+rdbx-storage = { path = "../rdbx-storage" }
+
+[dev-dependencies]
+proptest = { workspace = true }

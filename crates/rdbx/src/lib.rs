@@ -1,15 +1,15 @@
 //! # RDBX — High-Performance Embedded Database Engine
 //!
-//! Phase 3 exposes the WAL-backed transaction layer: a [`Database`] handle
-//! with a persistent [`PageManager`], an in-memory [`BufferPool`], a schema
-//! [`Catalog`], and a crash-safe [`rdbx_wal::WalManager`].
-//!
-//! Transactions, MVCC, B+Tree, and SQL arrive in later milestones.
+//! Phase 4 exposes the B+Tree index on top of the WAL-backed transaction
+//! layer. The `rdbx_btree` crate operates on a [`BTreeStore`], implemented
+//! here by [`Transaction`] (WAL-backed writes) and by [`Database`] (direct
+//! writes used by `create_table`).
 
 pub mod database;
 pub mod transaction;
 
 pub use database::Database;
+pub use rdbx_btree::{BTree, BTreeStore, InternalNode, LeafNode, Node};
 pub use rdbx_buffer::{BufferPool, BufferStats, Frame, FrameId};
 pub use rdbx_core::{
     DEFAULT_BUFFER_POOL_CAPACITY, DEFAULT_PAGE_SIZE, DatabaseOptions, Error, EvictionPolicyKind,
