@@ -651,6 +651,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdbx-query"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rdbx-btree",
+ "rdbx-core",
+ "rdbx-storage",
+]
+
+[[package]]
 name = "rdbx-storage"
 version = "0.1.0"
 dependencies = [

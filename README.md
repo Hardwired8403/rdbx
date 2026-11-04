@@ -21,47 +21,10 @@ PostgreSQL, or RocksDB.
 | B+Tree index (search/insert/delete/range) | 4 | ✅ implemented |
 | MVCC (in-memory snapshot isolation) | 5a | ✅ implemented |
 | MVCC persistence + multi-writer + GC | 5b | ✅ implemented |
-| Query engine / optimiser | 6 | ⏳ planned |
+| Query engine (logical/physical plans, optimiser) | 6 | ✅ implemented |
 | SQL parser + executor | 7 | ⏳ planned |
 | CLI / productisation | 8 | ⏳ planned |
 
-## Isolation guarantees
-
-| Property | Status |
-|---|---|
-| Snapshot isolation (MVCC) | ✅ implemented |
-| Write-write conflict detection (first-updater-wins) | ✅ implemented |
-| Persistent MVCC versions (separate B+Tree) | ✅ implemented |
-| Multi-writer concurrency (`Arc<Mutex<>>` per subsystem) | ✅ implemented |
-| Version garbage collection | ✅ implemented (called on checkpoint / explicit `gc()`) |
-| Serializable isolation | ❌ not implemented |
-
-RDBX does not claim stronger isolation than this table.
-
-## Quick start
-
-```rust
-use rdbx::{Database, DatabaseOptions, Visible};
-
-fn main() -> rdbx::Result<()> {
-    let db = Database::open("./data", DatabaseOptions::default())?;
-
-    // Write through MVCC:
-    let mut txn = db.begin_transaction()?;
-    txn.mvcc_write(b"users/alice".to_vec(), Some(b"42".to_vec()))?;
-    txn.commit()?;
-
-    // Read through a snapshot:
-    let mut txn = db.begin_transaction()?;
-    assert_eq!(
-        txn.mvcc_read(b"users/alice")?,
-        Visible::Present(b"42".to_vec()),
-    );
-    txn.rollback()?;
-
-    db.close()
-}
-```
 
 ## Project layout
 
@@ -73,6 +36,7 @@ crates/
 ├── rdbx-wal      — write-ahead log, crash recovery
 ├── rdbx-btree    — B+Tree index (storage-agnostic via BTreeStore)
 ├── rdbx-mvcc     — MVCC model + version store abstraction
+├── rdbx-query — query engine: value/plan/exec/optimizer
 ├── rdbx          — public Database handle + transactions
 └── rdbx-bench    — Criterion benchmarks
 docs/
@@ -81,6 +45,31 @@ docs/
 ├── storage/BTREE.md
 ├── transactions/WAL.md
 └── transactions/MVCC.md
+```
+
+
+## Query engine quick start
+
+```rust
+use rdbx_query::{execute, optimize, LogicalPlan};
+use rdbx_query::plan::{Expr, BinOp};
+use rdbx_query::value::Value;
+
+// Describe what you want as a logical plan...
+let plan = LogicalPlan::Filter {
+    input: Box::new(LogicalPlan::Scan { root }),
+    predicate: Expr::Binary(
+        Box::new(Expr::Column(0)),
+        BinOp::Ge,
+        Box::new(Expr::Literal(Value::Int(100))),
+    ),
+};
+
+// Optimise (index scan, predicate pushdown) and execute.
+let mut exec = execute(optimize(plan), &mut btree_store)?;
+while let Some(row) = exec.fetch_next()? {
+    println!("{:?}", row);
+}
 ```
 
 ## Testing
@@ -103,22 +92,18 @@ RDBX does **not** claim stronger durability than this table.
 
 ## Known limitations
 
-- MVCC uses a separate B+Tree for versions; user tables remain single-version
-(Phase 6 will route user data through MVCC versions too).
-- Row-level MVCC in the user B+Tree is not implemented.
-- Buffer pool is thread-safe via coarse-grained Mutex, not per-page latches.
-- B+Tree page allocation is not WAL-logged: aborted transactions may
-orphan pages.
-- No redistribution in the B+Tree; underflow is handled by merge-only.
-- Keys are opaque bytes with lexicographic comparison; typed encoding is
-the SQL layer's responsibility (Phase 7).
-- Catalog fits in one page and is not transactional.
-- Recovery has no compensation log records (CLRs); aborted transactions
-are undone again on each recovery pass.
-- Serializable isolation is not implemented.
-- `next_commit_ts` restore at `Database::open` scans the entire MVCC tree; acceptable for Phase 5b, will be optimized in Phase 6.
-- `__rdbx_mvcc__` is an internal table stored in the catalog and filtered
-out of `Database::tables()` / `Database::table()`.
+- Query engine: aggregation is declared but not executed yet; Sort
+materializes all rows in memory; no cost-based join.
+- MVCC: user tables remain single-version (versions live in a
+separate internal tree). Serializable isolation is not implemented.
+- Storage: B+Tree page allocation is not WAL-logged; aborted
+transactions may orphan pages.
+- B+Tree: no redistribution on underflow, merge-only.
+- Catalog: fits in one page and is not transactional.
+- WAL: no CLRs; aborted transactions are undone again on each
+recovery pass.
+- `next_commit_ts` restore at `Database::open` is O(N) over the
+MVCC tree.
 
 ## Documentation
 

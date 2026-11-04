@@ -1,0 +1,16 @@
+[package]
+name = "rdbx-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Query engine for RDBX: logical/physical plans and operators."
+
+[dependencies]
+rdbx-core    = { workspace = true }
+rdbx-storage = { workspace = true }
+rdbx-btree   = { workspace = true }
+
+[dev-dependencies]
+proptest     = { workspace = true }
