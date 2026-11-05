@@ -16,3 +16,4 @@ rdbx-btree   = { workspace = true }
 rdbx-mvcc    = { workspace = true }
 rdbx-query   = { workspace = true }
 rdbx-sql     = { workspace = true }
+uuid         = { workspace = true }

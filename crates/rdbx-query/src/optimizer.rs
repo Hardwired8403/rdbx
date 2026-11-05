@@ -95,6 +95,24 @@ fn physicalize(plan: LogicalPlan, lower: Option<Vec<u8>>, upper: Option<Vec<u8>>
             upper,
             value,
         },
+        LogicalPlan::UpdateSet {
+            root,
+            lower,
+            upper,
+            assignments,
+        } => PhysicalPlan::UpdateSet {
+            root,
+            lower,
+            upper,
+            assignments,
+        },
+        LogicalPlan::Count { input, column } => {
+            let inner = physicalize(*input, None, None);
+            PhysicalPlan::Count {
+                input: Box::new(inner),
+                column,
+            }
+        }
     }
 }
 

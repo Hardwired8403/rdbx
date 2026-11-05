@@ -1,5 +1,6 @@
 pub mod database;
 mod mvcc_store;
+mod schema_store;
 pub mod sql;
 pub mod transaction;
 

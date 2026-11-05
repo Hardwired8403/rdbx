@@ -41,6 +41,19 @@ enum ExecState<'a, S: BTreeStore> {
         value: Vec<u8>,
         done: bool,
     },
+    UpdateSet {
+        root: PageId,
+        lower: Option<Vec<u8>>,
+        upper: Option<Vec<u8>>,
+        assignments: Vec<(usize, Expr)>,
+        done: bool,
+        store: &'a mut S,
+    },
+    Count {
+        source: Box<ExecState<'a, S>>,
+        column: Option<usize>,
+        done: bool,
+    },
 }
 
 struct ScanState {
@@ -137,6 +150,27 @@ fn build_state<'a, S: BTreeStore>(
             value,
             done: false,
         },
+        PhysicalPlan::UpdateSet {
+            root,
+            lower,
+            upper,
+            assignments,
+        } => ExecState::UpdateSet {
+            store,
+            root,
+            lower,
+            upper,
+            assignments,
+            done: false,
+        },
+        PhysicalPlan::Count { input, column } => {
+            let source = Box::new(build_state(*input, store)?);
+            ExecState::Count {
+                source,
+                column,
+                done: false,
+            }
+        }
     })
 }
 
@@ -194,10 +228,11 @@ fn step<'a, S: BTreeStore>(state: &mut ExecState<'a, S>) -> Result<Option<Row>> 
             }
             *done = true;
             let mut tree = BTree::open(*root);
+            let count = rows.len();
             for (k, v) in rows.drain(..) {
                 tree.insert(&mut **store, k, v)?;
             }
-            Ok(Some(vec![]))
+            Ok(Some(vec![Value::Int(count as i64)]))
         }
         ExecState::Delete {
             store,
@@ -216,10 +251,11 @@ fn step<'a, S: BTreeStore>(state: &mut ExecState<'a, S>) -> Result<Option<Row>> 
                 .into_iter()
                 .map(|(k, _)| k)
                 .collect();
+            let count = keys.len();
             for k in keys {
                 tree.delete(&mut **store, &k)?;
             }
-            Ok(Some(vec![]))
+            Ok(Some(vec![Value::Int(count as i64)]))
         }
         ExecState::Update {
             store,
@@ -235,12 +271,75 @@ fn step<'a, S: BTreeStore>(state: &mut ExecState<'a, S>) -> Result<Option<Row>> 
             *done = true;
             let mut tree = BTree::open(*root);
             let existing = tree.range(&mut **store, lower.as_deref(), upper.as_deref())?;
+            let count = existing.len();
             for (k, _) in existing {
                 tree.insert(&mut **store, k, value.clone())?;
             }
-            Ok(Some(vec![]))
+            Ok(Some(vec![Value::Int(count as i64)]))
+        }
+        ExecState::UpdateSet {
+            store,
+            root,
+            lower,
+            upper,
+            assignments,
+            done,
+            ..
+        } => {
+            if *done {
+                return Ok(None);
+            }
+            *done = true;
+            let mut tree = BTree::open(*root);
+            let existing = tree.range(&mut **store, lower.as_deref(), upper.as_deref())?;
+            let mut updated = 0usize;
+            for (k, v) in existing {
+                let mut row = codec::decode_row(&v)?;
+                for (col, expr) in assignments.iter() {
+                    let new_val = eval_expr_public(expr, &row)?;
+                    while row.len() <= *col {
+                        row.push(Value::Null);
+                    }
+                    row[*col] = new_val;
+                }
+                let payload = codec::encode_row(&row);
+                tree.insert(&mut **store, k, payload)?;
+                updated += 1;
+            }
+            Ok(Some(vec![Value::Int(updated as i64)]))
+        }
+        ExecState::Count {
+            source,
+            column,
+            done,
+        } => {
+            if *done {
+                return Ok(None);
+            }
+            *done = true;
+            let mut n: u64 = 0;
+            while let Some(row) = step(source)? {
+                match column {
+                    None => n += 1,
+                    Some(i) => {
+                        let count = row.get(*i).map(|value| !value.is_null()).unwrap_or(false);
+                        if count {
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            Ok(Some(vec![Value::Int(n as i64)]))
         }
     }
+}
+
+pub fn eval_expr_public(expr: &Expr, row: &Row) -> Result<Value> {
+    eval_expr(expr, row)
+}
+
+pub fn eval_expr_pub(expr: &Expr, row: &Row) -> Result<Value> {
+    eval_expr(expr, row)
 }
 
 fn eval(expr: &Expr, row: &Row) -> Result<bool> {

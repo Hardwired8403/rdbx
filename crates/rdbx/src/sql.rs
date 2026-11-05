@@ -53,6 +53,17 @@ impl Database {
             Statement::CreateTable { name, columns } => {
                 let schema = TableSchema::from_defs(name.clone(), &columns).map_err(map_sql_err)?;
                 self.create_table_locked(&name)?;
+                let schema_hash = uuid::Uuid::new_v4().into_bytes();
+                {
+                    let mut catalog = self.catalog.lock().unwrap();
+                    if let Some(desc) = catalog.tables.iter_mut().find(|t| t.name == name) {
+                        desc.schema_hash = schema_hash;
+                    }
+                    let mut mgr = self.manager.lock().unwrap();
+                    catalog.flush(&mut mgr)?;
+                }
+                self.schema_store
+                    .store(schema_hash, rdbx_sql::codec::encode_schema(&schema))?;
                 self.sql_catalog.lock().unwrap().insert(schema);
                 return Ok(QueryResult::Affected(0));
             }
@@ -61,10 +72,11 @@ impl Database {
                 self.drop_table_locked(&name)?;
                 return Ok(QueryResult::Affected(0));
             }
-            Statement::CreateIndex { .. } | Statement::DropIndex { .. } => {
-                return Err(Error::Internal(
-                    "CREATE INDEX / DROP INDEX is not supported yet".into(),
-                ));
+            Statement::CreateIndex { .. } => {
+                return Err(Error::Internal("CREATE INDEX not supported yet".into()));
+            }
+            Statement::DropIndex { .. } => {
+                return Err(Error::Internal("DROP INDEX not supported yet".into()));
             }
             _ => {}
         }
@@ -97,11 +109,11 @@ impl Database {
             }
             Statement::Update { .. } => {
                 txn.commit()?;
-                Ok(QueryResult::Affected(0))
+                Ok(QueryResult::Affected(affected_count(&rows)))
             }
             Statement::Delete { .. } => {
                 txn.commit()?;
-                Ok(QueryResult::Affected(0))
+                Ok(QueryResult::Affected(affected_count(&rows)))
             }
             _ => Err(Error::Internal("unexpected statement".into())),
         }
@@ -121,6 +133,15 @@ fn statement_table(stmt: &Statement) -> Option<&str> {
 fn compute_columns(items: &[SelectItem], catalog: &SqlCatalog, table: &str) -> Vec<String> {
     let schema = catalog.get(table);
     let mut out = Vec::new();
+    if items.len() == 1
+        && let SelectItem::Expr {
+            expr: Expr::Call(name, _),
+            ..
+        } = &items[0]
+        && name.eq_ignore_ascii_case("COUNT")
+    {
+        return vec!["count".to_string()];
+    }
     for item in items {
         match item {
             SelectItem::Wildcard => {
@@ -136,4 +157,15 @@ fn compute_columns(items: &[SelectItem], catalog: &SqlCatalog, table: &str) -> V
         }
     }
     out
+}
+
+fn affected_count(rows: &[Row]) -> u64 {
+    rows.iter()
+        .filter_map(|row| row.first())
+        .filter_map(|value| match value {
+            rdbx_query::value::Value::Int(n) => Some(*n as u64),
+            _ => None,
+        })
+        .next()
+        .unwrap_or(0)
 }

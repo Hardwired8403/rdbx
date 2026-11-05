@@ -497,12 +497,38 @@ impl Parser {
             TokenKind::True => Ok(Expr::Bool(true)),
             TokenKind::False => Ok(Expr::Bool(false)),
             TokenKind::Null => Ok(Expr::Null),
+            TokenKind::Count => {
+                self.expect(&TokenKind::LParen)?;
+                if self.peek() == &TokenKind::Star {
+                    self.advance();
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(Expr::Call("COUNT".to_string(), vec![]))
+                } else {
+                    let mut args = Vec::new();
+                    loop {
+                        args.push(self.parse_expr()?);
+                        if self.peek() == &TokenKind::Comma {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(Expr::Call("COUNT".to_string(), args))
+                }
+            }
             TokenKind::Ident(name) => {
                 if self.peek() == &TokenKind::LParen {
                     self.advance();
                     let mut args = Vec::new();
                     if self.peek() != &TokenKind::RParen {
                         loop {
+                            if name.eq_ignore_ascii_case("count") && self.peek() == &TokenKind::Star
+                            {
+                                self.advance();
+                                self.expect(&TokenKind::RParen)?;
+                                return Ok(Expr::Call("COUNT".to_string(), vec![]));
+                            }
                             args.push(self.parse_expr()?);
                             if self.peek() == &TokenKind::Comma {
                                 self.advance();

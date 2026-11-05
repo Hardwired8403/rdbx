@@ -94,6 +94,16 @@ pub enum LogicalPlan {
         upper: Option<Vec<u8>>,
         value: Vec<u8>,
     },
+    UpdateSet {
+        root: PageId,
+        lower: Option<Vec<u8>>,
+        upper: Option<Vec<u8>>,
+        assignments: Vec<(usize, Expr)>,
+    },
+    Count {
+        input: Box<LogicalPlan>,
+        column: Option<usize>,
+    },
 }
 
 /// Physical plan.
@@ -139,5 +149,15 @@ pub enum PhysicalPlan {
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
         value: Vec<u8>,
+    },
+    UpdateSet {
+        root: PageId,
+        lower: Option<Vec<u8>>,
+        upper: Option<Vec<u8>>,
+        assignments: Vec<(usize, Expr)>,
+    },
+    Count {
+        input: Box<PhysicalPlan>,
+        column: Option<usize>,
     },
 }

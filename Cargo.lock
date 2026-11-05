@@ -608,6 +608,7 @@ dependencies = [
  "rdbx-sql",
  "rdbx-storage",
  "rdbx-wal",
+ "uuid",
 ]
 
 [[package]]

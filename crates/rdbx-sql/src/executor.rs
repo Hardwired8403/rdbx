@@ -78,6 +78,57 @@ where
     let root = root_for(table)
         .ok_or_else(|| SqlError::Semantic(format!("table '{table}' has no B+Tree root")))?;
 
+    if items.len() == 1
+        && let SelectItem::Expr {
+            expr: Expr::Call(name, args),
+            ..
+        } = &items[0]
+        && name.eq_ignore_ascii_case("COUNT")
+    {
+        if !order_by.is_empty() {
+            return Err(SqlError::Unimplemented(
+                "ORDER BY with COUNT is not supported yet".into(),
+            ));
+        }
+        let column = match args.as_slice() {
+            [] => None,
+            [Expr::Column(name)] => Some(
+                schema
+                    .column_index(name)
+                    .ok_or_else(|| SqlError::Semantic(format!("unknown column '{name}'")))?,
+            ),
+            _ => {
+                return Err(SqlError::Unimplemented(
+                    "COUNT requires either * or a single column".into(),
+                ));
+            }
+        };
+        let mut plan = LogicalPlan::Scan { root };
+        if let Some(f) = filter {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: lower_expr(f, schema)?,
+            };
+        }
+        let mut count_plan = LogicalPlan::Count {
+            input: Box::new(plan),
+            column,
+        };
+        if let Some(n) = limit {
+            count_plan = LogicalPlan::Limit {
+                input: Box::new(count_plan),
+                n: *n,
+            };
+        }
+        return Ok(count_plan);
+    }
+    if items.iter().filter(|item| matches!(item, SelectItem::Expr { expr: Expr::Call(name, _), .. } if name.eq_ignore_ascii_case("COUNT"))).count() > 0
+    {
+        return Err(SqlError::Unimplemented(
+            "mixing aggregates and columns is not supported yet".into(),
+        ));
+    }
+
     // Base scan.
     let mut plan = LogicalPlan::Scan { root };
 
@@ -264,8 +315,8 @@ where
         ));
     }
 
-    // Phase 7 restricts UPDATE to constant values on non-key columns and
-    // requires a filter that pins the PK to a single value.
+    // Phase 7 requires UPDATE to rewrite only non-PK columns and to
+    // filter on a single PRIMARY KEY value.
     if assignments.iter().any(|(c, _)| {
         let lower = c.to_ascii_lowercase();
         schema
@@ -287,38 +338,20 @@ where
     };
     let (lower, upper) = range_from_filter(filter_expr, schema)?;
 
-    // Apply assignments to a placeholder row? No — Phase 7 UPDATE
-    // rewrites the whole value. We construct the new row by starting
-    // from Null and only setting the assigned columns. This is only
-    // correct if the caller is also going to use the resulting row as
-    // the full new value, which is what `rdbx-query::update` does
-    // (it overwrites value for all matched rows).
-    //
-    // To make UPDATE semantically useful, Phase 8 will add a full
-    // "read-modify-write" operator. For now we encode a row with only
-    // the assigned columns and reject multi-column updates.
-    if assignments.len() != 1 {
-        return Err(SqlError::Unimplemented(
-            "UPDATE with multiple assignments is not supported yet".into(),
-        ));
+    let mut assignments_q = Vec::with_capacity(assignments.len());
+    for (col_name, val_expr) in assignments {
+        let col_idx = schema
+            .column_index(col_name)
+            .ok_or_else(|| SqlError::Semantic(format!("unknown column '{col_name}'")))?;
+        let value = lower_expr(val_expr, schema)?;
+        assignments_q.push((col_idx, value));
     }
-    let (col_name, val_expr) = &assignments[0];
-    let col_idx = schema
-        .column_index(col_name)
-        .ok_or_else(|| SqlError::Semantic(format!("unknown column '{col_name}'")))?;
-    let value = const_eval(val_expr)?;
-    let coerced = schema.coerce(col_idx, &value)?;
-    // Encode a payload representing a row where only the updated column
-    // is set. This is a Phase 7 simplification; documented in SQL.md.
-    let mut row = vec![Value::Null; schema.columns.len()];
-    row[col_idx] = coerced;
-    let payload = rdbx_query::codec::encode_row(&row);
 
-    Ok(LogicalPlan::Update {
+    Ok(LogicalPlan::UpdateSet {
         root,
         lower,
         upper,
-        value: payload,
+        assignments: assignments_q,
     })
 }
 

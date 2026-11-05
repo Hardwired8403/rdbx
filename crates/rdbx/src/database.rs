@@ -11,6 +11,7 @@ use rdbx_storage::{Catalog, Page, PageManager, PageType, TableDescriptor};
 use rdbx_wal::{RecordKind, WalManager};
 
 use crate::mvcc_store::BTreeVersionStore;
+use crate::schema_store::SchemaStore;
 use crate::transaction::Transaction;
 
 pub struct Database {
@@ -22,6 +23,9 @@ pub struct Database {
     pub(crate) tm: Arc<Mutex<TransactionManager>>,
     pub(crate) mvcc_root: Mutex<PageId>,
     pub(crate) sql_catalog: Mutex<rdbx_sql::catalog::SqlCatalog>,
+    pub(crate) schema_store: Arc<SchemaStore>,
+    #[allow(dead_code)]
+    pub(crate) prepared: Mutex<Vec<Option<rdbx_sql::PreparedPlan>>>,
 }
 
 impl Database {
@@ -48,11 +52,25 @@ impl Database {
             .ok_or(Error::Overflow("txn id"))?;
 
         let mut catalog = Catalog::load(&mut manager)?;
-        let pool = BufferPool::new(
-            opts.buffer_pool_capacity,
-            manager.page_size(),
-            opts.buffer_pool_policy,
-        );
+        let schema_tree_root = if let Some(t) = catalog.table_by_name("__rdbx_schema__") {
+            t.root_page
+        } else {
+            let pid = manager.allocate_page(PageType::Index)?;
+            let leaf = LeafNode::new();
+            let mut page = Page::new(pid, PageType::Index, manager.page_size());
+            Node::Leaf(leaf).write_to(&mut page)?;
+            manager.write_page(&page)?;
+            let desc = TableDescriptor {
+                id: catalog.next_table_id.max(1),
+                name: "__rdbx_schema__".to_string(),
+                root_page: pid,
+                schema_hash: [0u8; 16],
+            };
+            catalog.insert(desc);
+            catalog.flush(&mut manager)?;
+            manager.flush()?;
+            pid
+        };
 
         let mvcc_root = if let Some(t) = catalog.table_by_name("__rdbx_mvcc__") {
             t.root_page
@@ -75,7 +93,31 @@ impl Database {
         };
 
         let manager_arc = Arc::new(Mutex::new(manager));
+        let pool = BufferPool::new(
+            opts.buffer_pool_capacity,
+            manager_arc.lock().unwrap().page_size(),
+            opts.buffer_pool_policy,
+        );
         let pool_arc = Arc::new(Mutex::new(pool));
+
+        let schema_store = Arc::new(SchemaStore::new(schema_tree_root));
+        schema_store.bind(manager_arc.clone(), pool_arc.clone());
+
+        let mut sql_catalog = rdbx_sql::SqlCatalog::new();
+        for table in catalog.tables.iter() {
+            if table.name.starts_with("__") {
+                continue;
+            }
+            if table.schema_hash == [0u8; 16] {
+                continue;
+            }
+            if let Some(blob) = schema_store.load(&table.schema_hash)? {
+                let mut schema = rdbx_sql::codec::decode_schema(&blob)
+                    .map_err(|e| Error::Internal(format!("schema decode: {e}")))?;
+                schema.name = table.name.clone();
+                sql_catalog.insert(schema);
+            }
+        }
 
         let mut store = BTreeVersionStore::new(mvcc_root);
         store.bind(manager_arc.clone(), pool_arc.clone());
@@ -111,7 +153,9 @@ impl Database {
             wal: Arc::new(Mutex::new(wal)),
             tm: Arc::new(Mutex::new(tm)),
             mvcc_root: Mutex::new(mvcc_root),
-            sql_catalog: Mutex::new(rdbx_sql::catalog::SqlCatalog::new()),
+            sql_catalog: Mutex::new(sql_catalog),
+            schema_store,
+            prepared: Mutex::new(Vec::new()),
         })
     }
 
@@ -201,6 +245,21 @@ impl Database {
                 }
                 mgr.flush()?;
                 *root_guard = new_root;
+            }
+        }
+
+        let schema_root = self.schema_store.current_root();
+        {
+            let mut mgr = self.manager.lock().unwrap();
+            let mut catalog = self.catalog.lock().unwrap();
+            if let Some(desc) = catalog
+                .tables
+                .iter_mut()
+                .find(|t| t.name == "__rdbx_schema__")
+                && desc.root_page != schema_root
+            {
+                desc.root_page = schema_root;
+                catalog.flush(&mut mgr)?;
             }
         }
 
