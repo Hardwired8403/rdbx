@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use rdbx_core::PageId;
+
 use crate::ast::{ColumnDef, DataType};
 use crate::error::{SqlError, SqlResult};
 
@@ -19,6 +21,7 @@ pub struct ColumnSchema {
 pub struct IndexDef {
     pub name: String,
     pub column: usize,
+    pub root_page: PageId,
 }
 
 #[derive(Debug, Clone, PartialEq)]

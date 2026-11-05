@@ -42,7 +42,10 @@ fn schema_persists_across_reopen() {
     let db = Database::open(&path, DatabaseOptions::default()).unwrap();
     match db.execute("SELECT * FROM users WHERE id = 2").unwrap() {
         QueryResult::Rows { rows, .. } => {
-            assert_eq!(rows, vec![vec![Value::Int(2), Value::Bytes(b"bob".to_vec())]]);
+            assert_eq!(
+                rows,
+                vec![vec![Value::Int(2), Value::Bytes(b"bob".to_vec())]]
+            );
         }
         other => panic!("expected Rows, got {other:?}"),
     }
@@ -106,7 +109,10 @@ fn update_preserves_other_columns() {
 
     match db.execute("SELECT * FROM t WHERE id = 2").unwrap() {
         QueryResult::Rows { rows, .. } => {
-            assert_eq!(rows[0], vec![Value::Int(2), Value::Int(99), Value::Bytes(b"y".to_vec())]);
+            assert_eq!(
+                rows[0],
+                vec![Value::Int(2), Value::Int(99), Value::Bytes(b"y".to_vec())]
+            );
         }
         other => panic!("expected Rows, got {other:?}"),
     }
@@ -120,7 +126,8 @@ fn update_rejects_pk() {
     let db = Database::open(&path, DatabaseOptions::default()).unwrap();
     db.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)")
         .unwrap();
-    db.execute("INSERT INTO t (id, name) VALUES (1, 'a')").unwrap();
+    db.execute("INSERT INTO t (id, name) VALUES (1, 'a')")
+        .unwrap();
 
     let err = db.execute("UPDATE t SET id = 2 WHERE id = 1").unwrap_err();
     assert!(err.to_string().contains("PRIMARY KEY") || err.to_string().contains("not supported"));

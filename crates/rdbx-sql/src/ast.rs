@@ -80,8 +80,30 @@ pub enum Expr {
     Column(String),
     Binary(Box<Expr>, BinOp, Box<Expr>),
     Unary(UnaryOp, Box<Expr>),
-    /// Function call. Only `COUNT` is currently recognised.
+    /// Placeholder for prepared statements.
+    Placeholder(u32),
+    /// Scalar subquery: `(SELECT ...)`.
+    Subquery(Box<Statement>),
+    /// `expr IN (SELECT ...)` / `expr IN (literal, ...)`.
+    InSubquery(Box<Expr>, Box<Statement>),
+    /// Function call. `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` are recognised.
     Call(String, Vec<Expr>),
+}
+
+/// Aggregate functions recognised by the planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateKind {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateSpec {
+    pub kind: AggregateKind,
+    pub column: Option<String>,
 }
 
 /// A select-list item.
@@ -122,6 +144,8 @@ pub enum Statement {
         filter: Option<Expr>,
         order_by: Vec<(String, bool)>, // (column, ascending)
         limit: Option<usize>,
+        group_by: Vec<String>,
+        having: Option<Expr>,
     },
     Update {
         table: String,

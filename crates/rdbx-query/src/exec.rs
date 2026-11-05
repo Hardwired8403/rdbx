@@ -54,6 +54,12 @@ enum ExecState<'a, S: BTreeStore> {
         column: Option<usize>,
         done: bool,
     },
+    Aggregate {
+        source: Box<ExecState<'a, S>>,
+        group_by: Vec<usize>,
+        aggregates: Vec<crate::plan::AggregateSpec>,
+        done: bool,
+    },
 }
 
 struct ScanState {
@@ -168,6 +174,19 @@ fn build_state<'a, S: BTreeStore>(
             ExecState::Count {
                 source,
                 column,
+                done: false,
+            }
+        }
+        PhysicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            let source = Box::new(build_state(*input, store)?);
+            ExecState::Aggregate {
+                source,
+                group_by,
+                aggregates,
                 done: false,
             }
         }
@@ -331,6 +350,50 @@ fn step<'a, S: BTreeStore>(state: &mut ExecState<'a, S>) -> Result<Option<Row>> 
             }
             Ok(Some(vec![Value::Int(n as i64)]))
         }
+        ExecState::Aggregate {
+            source,
+            group_by,
+            aggregates,
+            done,
+        } => {
+            if *done {
+                return Ok(None);
+            }
+            *done = true;
+            let mut groups: std::collections::BTreeMap<Vec<u8>, Vec<Row>> =
+                std::collections::BTreeMap::new();
+            while let Some(row) = step(source)? {
+                let key = group_by
+                    .iter()
+                    .map(|idx| {
+                        row.get(*idx)
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                            .encode_key()
+                            .unwrap_or_else(|_| vec![0xFE])
+                    })
+                    .fold(Vec::new(), |mut acc, mut part| {
+                        acc.append(&mut part);
+                        acc
+                    });
+                groups.entry(key).or_default().push(row);
+            }
+
+            let mut rows = Vec::new();
+            for group in groups.values() {
+                let mut out = Vec::new();
+                for idx in &*group_by {
+                    let value = group[0].get(*idx).cloned().unwrap_or(Value::Null);
+                    out.push(value);
+                }
+                for spec in &*aggregates {
+                    out.push(compute_aggregate(spec, group));
+                }
+                rows.push(out);
+            }
+            let mut iter = rows.into_iter();
+            Ok(iter.next())
+        }
     }
 }
 
@@ -420,6 +483,69 @@ fn sort_rows(rows: &mut [Row], keys: &[crate::plan::SortKey]) {
         }
         std::cmp::Ordering::Equal
     });
+}
+
+fn compute_aggregate(spec: &crate::plan::AggregateSpec, rows: &[Row]) -> Value {
+    match spec.kind {
+        crate::plan::Aggregate::Count => {
+            let count = rows.len();
+            Value::Int(count as i64)
+        }
+        crate::plan::Aggregate::Sum(col) => {
+            let mut total = 0.0_f64;
+            let mut seen = false;
+            for row in rows {
+                match row.get(col).cloned().unwrap_or(Value::Null) {
+                    Value::Int(v) => {
+                        total += v as f64;
+                        seen = true;
+                    }
+                    Value::Float(v) => {
+                        total += v;
+                        seen = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !seen {
+                Value::Null
+            } else {
+                Value::Float(total)
+            }
+        }
+        crate::plan::Aggregate::Min(col) => rows
+            .iter()
+            .filter_map(|row| row.get(col).cloned())
+            .min_by(value_cmp)
+            .unwrap_or(Value::Null),
+        crate::plan::Aggregate::Max(col) => rows
+            .iter()
+            .filter_map(|row| row.get(col).cloned())
+            .max_by(value_cmp)
+            .unwrap_or(Value::Null),
+        crate::plan::Aggregate::Avg(col) => {
+            let mut sum = 0.0_f64;
+            let mut count = 0usize;
+            for row in rows {
+                match row.get(col).cloned().unwrap_or(Value::Null) {
+                    Value::Int(v) => {
+                        sum += v as f64;
+                        count += 1;
+                    }
+                    Value::Float(v) => {
+                        sum += v;
+                        count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if count == 0 {
+                Value::Null
+            } else {
+                Value::Float(sum / count as f64)
+            }
+        }
+    }
 }
 
 fn decode_row_with_key(key: &[u8], value: &[u8]) -> Result<Row> {

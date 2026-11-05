@@ -21,7 +21,7 @@ pub use rdbx_storage::{
     TableDescriptor,
 };
 pub use rdbx_wal::{RecoveryReport, RecoveryStopReason, WalManager};
-pub use sql::QueryResult;
+pub use sql::{PreparedStatement, QueryResult};
 pub use transaction::Transaction;
 
 // Re-export `Row` and `Value` from rdbx-query so SQL users don't need a

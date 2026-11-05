@@ -61,6 +61,7 @@ fn select_with_where_and_order() {
             filter,
             order_by,
             limit,
+            ..
         } => {
             assert_eq!(items.len(), 2);
             assert_eq!(table, "users");

@@ -30,7 +30,11 @@ where
             filter,
             order_by,
             limit,
-        } => compile_select(items, table, filter, order_by, limit, catalog, &root_for),
+            group_by,
+            having,
+        } => compile_select(
+            items, table, filter, order_by, limit, group_by, having, catalog, &root_for,
+        ),
         Statement::Insert {
             table,
             columns,
@@ -60,12 +64,15 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_select<F>(
     items: &[SelectItem],
     table: &str,
     filter: &Option<Expr>,
     order_by: &[(String, bool)],
     limit: &Option<usize>,
+    group_by: &[String],
+    having: &Option<Expr>,
     catalog: &SqlCatalog,
     root_for: &F,
 ) -> SqlResult<LogicalPlan>
@@ -77,6 +84,18 @@ where
         .ok_or_else(|| SqlError::Semantic(format!("unknown table '{table}'")))?;
     let root = root_for(table)
         .ok_or_else(|| SqlError::Semantic(format!("table '{table}' has no B+Tree root")))?;
+
+    if having.is_some() {
+        return Err(SqlError::Unimplemented(
+            "HAVING clause is not supported yet".into(),
+        ));
+    }
+
+    if !group_by.is_empty() || items.iter().any(is_aggregate_select_item) {
+        return compile_grouped_select(
+            items, table, filter, order_by, limit, group_by, catalog, root_for,
+        );
+    }
 
     if items.len() == 1
         && let SelectItem::Expr {
@@ -215,6 +234,132 @@ where
             "SELECT of computed expressions is not supported yet".into(),
         ));
     }
+
+    if let Some(n) = limit {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            n: *n,
+        };
+    }
+
+    Ok(plan)
+}
+
+fn is_aggregate_select_item(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::Expr {
+            expr: Expr::Call(name, _),
+            ..
+        } => matches!(
+            name.to_ascii_uppercase().as_str(),
+            "COUNT" | "SUM" | "MIN" | "MAX" | "AVG"
+        ),
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_grouped_select<F>(
+    items: &[SelectItem],
+    table: &str,
+    filter: &Option<Expr>,
+    order_by: &[(String, bool)],
+    limit: &Option<usize>,
+    group_by: &[String],
+    catalog: &SqlCatalog,
+    root_for: &F,
+) -> SqlResult<LogicalPlan>
+where
+    F: Fn(&str) -> Option<PageId>,
+{
+    let schema = catalog
+        .get(table)
+        .ok_or_else(|| SqlError::Semantic(format!("unknown table '{table}'")))?;
+    let root = root_for(table)
+        .ok_or_else(|| SqlError::Semantic(format!("table '{table}' has no B+Tree root")))?;
+
+    let mut plan = LogicalPlan::Scan { root };
+    if let Some(f) = filter {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate: lower_expr(f, schema)?,
+        };
+    }
+
+    let mut group_cols = Vec::with_capacity(group_by.len());
+    for name in group_by {
+        let idx = schema
+            .column_index(name)
+            .ok_or_else(|| SqlError::Semantic(format!("unknown column '{name}' in GROUP BY")))?;
+        group_cols.push(idx);
+    }
+
+    let mut aggregates = Vec::new();
+    for item in items {
+        if let SelectItem::Expr {
+            expr: Expr::Call(name, args),
+            ..
+        } = item
+        {
+            let kind = match name.to_ascii_uppercase().as_str() {
+                "COUNT" => crate::ast::AggregateKind::Count,
+                "SUM" => crate::ast::AggregateKind::Sum,
+                "MIN" => crate::ast::AggregateKind::Min,
+                "MAX" => crate::ast::AggregateKind::Max,
+                "AVG" => crate::ast::AggregateKind::Avg,
+                _ => continue,
+            };
+            let column = match args.as_slice() {
+                [] => None,
+                [Expr::Column(col)] => Some(
+                    schema
+                        .column_index(col)
+                        .ok_or_else(|| SqlError::Semantic(format!("unknown column '{col}'")))?,
+                ),
+                _ => {
+                    return Err(SqlError::Unimplemented(
+                        "aggregate calls only support a single column or COUNT(*)".into(),
+                    ));
+                }
+            };
+            let aggregate = match kind {
+                crate::ast::AggregateKind::Count => rdbx_query::plan::Aggregate::Count,
+                crate::ast::AggregateKind::Sum => rdbx_query::plan::Aggregate::Sum(
+                    column
+                        .ok_or_else(|| SqlError::Unimplemented("SUM requires a column".into()))?,
+                ),
+                crate::ast::AggregateKind::Min => rdbx_query::plan::Aggregate::Min(
+                    column
+                        .ok_or_else(|| SqlError::Unimplemented("MIN requires a column".into()))?,
+                ),
+                crate::ast::AggregateKind::Max => rdbx_query::plan::Aggregate::Max(
+                    column
+                        .ok_or_else(|| SqlError::Unimplemented("MAX requires a column".into()))?,
+                ),
+                crate::ast::AggregateKind::Avg => rdbx_query::plan::Aggregate::Avg(
+                    column
+                        .ok_or_else(|| SqlError::Unimplemented("AVG requires a column".into()))?,
+                ),
+            };
+            let output = aggregates.len() + group_cols.len();
+            aggregates.push(rdbx_query::plan::AggregateSpec {
+                kind: aggregate,
+                output,
+            });
+        }
+    }
+
+    if !order_by.is_empty() {
+        return Err(SqlError::Unimplemented(
+            "ORDER BY with GROUP BY is not supported yet".into(),
+        ));
+    }
+
+    plan = LogicalPlan::Aggregate {
+        input: Box::new(plan),
+        group_by: group_cols,
+        aggregates,
+    };
 
     if let Some(n) = limit {
         plan = LogicalPlan::Limit {
@@ -467,6 +612,11 @@ fn lower_expr(expr: &Expr, schema: &crate::catalog::TableSchema) -> SqlResult<QE
                 "function call '{name}' is not supported in WHERE"
             )));
         }
+        Expr::Placeholder(_) | Expr::Subquery(_) | Expr::InSubquery(_, _) => {
+            return Err(SqlError::Unimplemented(
+                "subqueries and placeholders are not supported in WHERE".into(),
+            ));
+        }
     })
 }
 
@@ -495,6 +645,12 @@ fn const_eval(expr: &Expr) -> SqlResult<Value> {
         Expr::Binary(_, _, _) | Expr::Unary(UnaryOp::Not, _) | Expr::Call(_, _) => {
             return Err(SqlError::Unimplemented(
                 "only literal constants are supported in INSERT / UPDATE values".into(),
+            ));
+        }
+        Expr::Placeholder(_) | Expr::Subquery(_) | Expr::InSubquery(_, _) => {
+            return Err(SqlError::Unimplemented(
+                "prepared statements and subqueries are not supported in constant expressions"
+                    .into(),
             ));
         }
     })

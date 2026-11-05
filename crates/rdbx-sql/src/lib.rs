@@ -13,4 +13,4 @@ pub use error::{SqlError, SqlResult};
 pub use executor::compile;
 pub use lexer::{Lexer, Token, TokenKind};
 pub use parser::Parser;
-pub use prepared::PreparedPlan;
+pub use prepared::{PreparedPlan, PreparedStatement};

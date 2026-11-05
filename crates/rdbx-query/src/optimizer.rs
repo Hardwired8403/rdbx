@@ -113,6 +113,18 @@ fn physicalize(plan: LogicalPlan, lower: Option<Vec<u8>>, upper: Option<Vec<u8>>
                 column,
             }
         }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            let inner = physicalize(*input, None, None);
+            PhysicalPlan::Aggregate {
+                input: Box::new(inner),
+                group_by,
+                aggregates,
+            }
+        }
     }
 }
 

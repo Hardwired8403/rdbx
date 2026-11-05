@@ -52,6 +52,13 @@ pub enum Aggregate {
     Avg(ColumnId),
 }
 
+/// Aggregate plan with grouping keys and aggregate outputs.
+#[derive(Debug, Clone)]
+pub struct AggregateSpec {
+    pub kind: Aggregate,
+    pub output: usize,
+}
+
 /// Logical plan.
 #[derive(Debug, Clone)]
 pub enum LogicalPlan {
@@ -103,6 +110,11 @@ pub enum LogicalPlan {
     Count {
         input: Box<LogicalPlan>,
         column: Option<usize>,
+    },
+    Aggregate {
+        input: Box<LogicalPlan>,
+        group_by: Vec<usize>,
+        aggregates: Vec<AggregateSpec>,
     },
 }
 
@@ -159,5 +171,10 @@ pub enum PhysicalPlan {
     Count {
         input: Box<PhysicalPlan>,
         column: Option<usize>,
+    },
+    Aggregate {
+        input: Box<PhysicalPlan>,
+        group_by: Vec<usize>,
+        aggregates: Vec<AggregateSpec>,
     },
 }

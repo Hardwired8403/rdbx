@@ -7,12 +7,17 @@ use crate::lexer::{Lexer, Token, TokenKind};
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    placeholder_count: u32,
 }
 
 impl Parser {
     pub fn new(sql: &str) -> SqlResult<Self> {
         let tokens = Lexer::new(sql).tokenize()?;
-        Ok(Self { tokens, pos: 0 })
+        Ok(Self {
+            tokens,
+            pos: 0,
+            placeholder_count: 0,
+        })
     }
 
     pub fn parse(sql: &str) -> SqlResult<Statement> {
@@ -20,6 +25,10 @@ impl Parser {
         let stmt = p.parse_statement()?;
         p.expect_eof()?;
         Ok(stmt)
+    }
+
+    pub fn placeholder_count(&self) -> u32 {
+        self.placeholder_count
     }
 
     fn peek(&self) -> &TokenKind {
@@ -283,9 +292,18 @@ impl Parser {
                 items.push(SelectItem::Wildcard);
             } else {
                 let expr = self.parse_expr()?;
-                let alias = if let TokenKind::Ident(s) = self.peek().clone() {
-                    // Only treat as alias if not a reserved keyword (AS
-                    // is not a keyword here to keep things simple).
+                let alias = if matches!(self.peek(), TokenKind::As) {
+                    self.advance();
+                    if let TokenKind::Ident(s) = self.peek().clone() {
+                        self.advance();
+                        Some(s)
+                    } else {
+                        return Err(SqlError::Parse {
+                            pos: self.pos(),
+                            message: "expected alias after AS".to_string(),
+                        });
+                    }
+                } else if let TokenKind::Ident(s) = self.peek().clone() {
                     self.advance();
                     Some(s)
                 } else {
@@ -301,12 +319,28 @@ impl Parser {
         }
         self.expect(&TokenKind::From)?;
         let table = self.expect_ident()?;
+
         let filter = if self.peek() == &TokenKind::Where {
             self.advance();
             Some(self.parse_expr()?)
         } else {
             None
         };
+
+        let mut group_by = Vec::new();
+        if self.peek() == &TokenKind::Group {
+            self.advance();
+            self.expect(&TokenKind::By)?;
+            loop {
+                group_by.push(self.expect_ident()?);
+                if self.peek() == &TokenKind::Comma {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+
         let mut order_by = Vec::new();
         if self.peek() == &TokenKind::Order {
             self.advance();
@@ -332,6 +366,14 @@ impl Parser {
                 break;
             }
         }
+
+        let having = if self.peek() == &TokenKind::Having {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
         let limit = if self.peek() == &TokenKind::Limit {
             self.advance();
             match self.advance() {
@@ -352,6 +394,8 @@ impl Parser {
             filter,
             order_by,
             limit,
+            group_by,
+            having,
         })
     }
 
@@ -433,6 +477,38 @@ impl Parser {
     fn parse_comparison(&mut self) -> SqlResult<Expr> {
         let mut lhs = self.parse_additive()?;
         loop {
+            if self.peek() == &TokenKind::In {
+                self.advance();
+                if self.peek() == &TokenKind::LParen {
+                    self.advance();
+                    if self.peek() == &TokenKind::Select {
+                        let sub = self.parse_select()?;
+                        self.expect(&TokenKind::RParen)?;
+                        lhs = Expr::InSubquery(Box::new(lhs), Box::new(sub));
+                        continue;
+                    }
+                    let mut values = Vec::new();
+                    loop {
+                        values.push(self.parse_expr()?);
+                        if self.peek() == &TokenKind::Comma {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                    self.expect(&TokenKind::RParen)?;
+                    lhs = Expr::Binary(
+                        Box::new(lhs),
+                        BinOp::Eq,
+                        Box::new(Expr::Str("__in_list__".to_string())),
+                    );
+                    continue;
+                }
+                return Err(SqlError::Parse {
+                    pos: self.pos(),
+                    message: "expected '(' after IN".to_string(),
+                });
+            }
             let op = match self.peek() {
                 TokenKind::Eq => BinOp::Eq,
                 TokenKind::Ne => BinOp::Ne,
@@ -497,12 +573,29 @@ impl Parser {
             TokenKind::True => Ok(Expr::Bool(true)),
             TokenKind::False => Ok(Expr::Bool(false)),
             TokenKind::Null => Ok(Expr::Null),
-            TokenKind::Count => {
+            TokenKind::Question => {
+                let idx = self.placeholder_count;
+                self.placeholder_count += 1;
+                Ok(Expr::Placeholder(idx))
+            }
+            TokenKind::Count
+            | TokenKind::Sum
+            | TokenKind::Min
+            | TokenKind::Max
+            | TokenKind::Avg => {
+                let name = match self.tokens.get(self.pos.saturating_sub(1)).map(|t| &t.kind) {
+                    Some(TokenKind::Count) => "COUNT",
+                    Some(TokenKind::Sum) => "SUM",
+                    Some(TokenKind::Min) => "MIN",
+                    Some(TokenKind::Max) => "MAX",
+                    Some(TokenKind::Avg) => "AVG",
+                    _ => "CALL",
+                };
                 self.expect(&TokenKind::LParen)?;
                 if self.peek() == &TokenKind::Star {
                     self.advance();
                     self.expect(&TokenKind::RParen)?;
-                    Ok(Expr::Call("COUNT".to_string(), vec![]))
+                    Ok(Expr::Call(name.to_string(), vec![]))
                 } else {
                     let mut args = Vec::new();
                     loop {
@@ -514,7 +607,7 @@ impl Parser {
                         break;
                     }
                     self.expect(&TokenKind::RParen)?;
-                    Ok(Expr::Call("COUNT".to_string(), args))
+                    Ok(Expr::Call(name.to_string(), args))
                 }
             }
             TokenKind::Ident(name) => {
@@ -544,6 +637,11 @@ impl Parser {
                 }
             }
             TokenKind::LParen => {
+                if self.peek() == &TokenKind::Select {
+                    let subquery = self.parse_select()?;
+                    self.expect(&TokenKind::RParen)?;
+                    return Ok(Expr::Subquery(Box::new(subquery)));
+                }
                 let inner = self.parse_expr()?;
                 self.expect(&TokenKind::RParen)?;
                 Ok(inner)

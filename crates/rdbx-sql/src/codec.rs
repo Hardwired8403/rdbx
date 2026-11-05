@@ -9,16 +9,16 @@ use crate::catalog::{ColumnSchema, IndexDef, TableSchema};
 /// Binary encoding:
 ///
 /// ```text
-/// version: u8 = 1
+/// version: u8 = 2
 /// column_count: u32
 /// for each column:
 ///     name_len: u16 | name | ty: u8 | flags: u8 | index: u32
 /// primary_key: u8 (0xFF = none)  -- actually u32 with 0xFFFF_FFFF for none
 /// index_count: u32
 /// for each index:
-///     name_len: u16 | name | column: u32
+///     name_len: u16 | name | column: u32 | root_page: u64
 /// ```
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 fn encode_ty(ty: DataType) -> u8 {
     match ty {
@@ -68,12 +68,17 @@ pub fn encode_schema(schema: &TableSchema) -> Vec<u8> {
         out.extend_from_slice(&(idx.name.len() as u16).to_le_bytes());
         out.extend_from_slice(idx.name.as_bytes());
         out.extend_from_slice(&(idx.column as u32).to_le_bytes());
+        out.extend_from_slice(&idx.root_page.0.to_le_bytes());
     }
     out
 }
 
 pub fn decode_schema(bytes: &[u8]) -> Result<TableSchema> {
-    if bytes.len() < 5 || bytes[0] != VERSION {
+    if bytes.len() < 5 {
+        return Err(Error::InvalidFile("bad schema blob version".into()));
+    }
+    let version = bytes[0];
+    if version != 1 && version != 2 {
         return Err(Error::InvalidFile("bad schema blob version".into()));
     }
     let mut p = 1usize;
@@ -107,7 +112,17 @@ pub fn decode_schema(bytes: &[u8]) -> Result<TableSchema> {
         let name_len = read_u16(bytes, &mut p)? as usize;
         let name = read_str(bytes, &mut p, name_len)?;
         let column = read_u32(bytes, &mut p)? as usize;
-        indexes.push(IndexDef { name, column });
+        let root_page = if version >= 2 {
+            let raw = read_u64(bytes, &mut p)?;
+            rdbx_core::PageId(raw)
+        } else {
+            rdbx_core::PageId(0)
+        };
+        indexes.push(IndexDef {
+            name,
+            column,
+            root_page,
+        });
     }
     Ok(TableSchema {
         name: String::new(), // name lives in the key
@@ -140,6 +155,15 @@ fn read_u32(b: &[u8], p: &mut usize) -> Result<u32> {
     }
     let v = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
     *p += 4;
+    Ok(v)
+}
+
+fn read_u64(b: &[u8], p: &mut usize) -> Result<u64> {
+    if *p + 8 > b.len() {
+        return Err(Error::InvalidFile("schema short".into()));
+    }
+    let v = u64::from_le_bytes(b[*p..*p + 8].try_into().unwrap());
+    *p += 8;
     Ok(v)
 }
 
